@@ -80,6 +80,9 @@ class ReferenceStore:
         finally:
             lock.release()
 
+    def path_of(self, cam: str, name: str) -> Path:
+        return self._paths(cam, name)[0]
+
     def names(self, cam: str) -> list[str]:
         try:
             return sorted(

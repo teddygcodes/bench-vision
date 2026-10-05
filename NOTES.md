@@ -62,3 +62,28 @@ triggering another review round; none affects results, data, or error handling.
 - `bench-vision capture` silences the server's own log, so an internal error's "details are in the server's stderr log" shows nothing there, and live-camera warnings (resolution mismatch, skipped inactive controls) are hidden.
 - `test_old_kernel_auto_switch_ordering_and_dropping` only checks ordering, despite its name.
 - `bench-vision capture` exits 0 when the capture couldn't be saved to captures/ (the WARNING text says so).
+
+## Deliverable 6
+- NaN/infinite mark values arrive as null from the MCP layer, so the error says "'x' is required".
+- The step body limit counts lines, not rendered lines: five long lines can wrap to ~15 and, at 720p, clip the body and hide the step image while the tool still reports "Step shown".
+- Mark text that doesn't fit beside its mark goes to the legend below the image, where an entry wider than the image is shortened with "…".
+- For image-sized pushes, an HTTP error from the display server is reported as "isn't running" (the server answers while the client is still sending the body).
+- `bench-vision call` silently ignores unknown argument keys (same class as the MCP-layer coercion notes).
+- The page skips re-rendering when the state JSON is unchanged; after a display-server restart, a push landing before the page reconnects with an identical id/label/caption could leave the old image showing.
+- The display server keeps its state only in memory, so a restart (e.g. by systemd) blanks the step panel.
+- The push endpoint accepts any data starting with FF D8 as a JPEG (only the bench-vision tools push).
+- Chromium could also get `--no-default-browser-check` and something for the "restore pages" bubble after a power cut (`--disable-session-crashed-bubble` or editing exit_type in its Preferences).
+- `Restart=on-failure` with `RestartSec=2` hits systemd's default start limit (5 in 10 s) if the port stays busy, leaving the unit failed (`systemctl --user reset-failed` clears it).
+- In mock mode, a config.toml containing only `[display]` fails with "no cameras defined".
+- The display server doesn't check the Host header (DNS rebinding); low risk since it binds 127.0.0.1 and requires a JSON Content-Type.
+- The red "reconnecting" bar covers the caption bar while the display server is down.
+- A chunked POST to the display gets the 413 "body must be 1..N bytes" message.
+- `show` replies show an absolute path when the project root is reached through a symlink (only when driving the code directly; the CLI resolves the root).
+- A mark label can sit over the board's own silkscreen text next to the mark (it avoids marks, not board features).
+- README: the "Wall display" section says it needs only `uv sync`, but the quick start above it also runs the (optional) test suite.
+- In a very dense cluster, a numbered badge can end up a little away from its mark (it never covers a mark; the legend below the image lists the text).
+- With ~20 marks in one tight cluster, a fallback badge can sit on another badge or label (the least-covering fallback); the legend still lists every text.
+- Legend rows are aligned by the top of each row's ink, so baselines shift slightly between rows (e.g. a row with accented capitals sits lower).
+- The legend font follows the image's long edge, so on a very narrow tall image (e.g. 200x1920) every entry is shortened to "N lo…".
+- Whitespace-only mark text passes validation and draws an empty label box.
+- Tabs, other control characters and glyphs the font lacks (emoji, CJK) draw as missing-glyph boxes.

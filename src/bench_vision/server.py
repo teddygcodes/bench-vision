@@ -20,7 +20,8 @@ Eyes on a soldering bench. Typically 'scope' (microscope, straight down) and 'si
 (low oblique from the left, shows fillet profile and the iron); call list_cameras for the
 actual set, then capture (or grid) for an overview and capture_region / capture_cell to
 zoom in. save_reference before rework and compare afterwards to see what changed.
-set_control adjusts focus/exposure/gain (real cameras need Linux/v4l2). Region
+set_control adjusts focus/exposure/gain (real cameras need Linux/v4l2). show / show_compare /
+show_step / show_clear drive the wall display (`bench-vision display`). Region
 coordinates are full-resolution pixels of the rotated frame; every reply states the
 frame size and the scale from the returned image."""
 
@@ -162,5 +163,48 @@ def build_server(bv: BenchVision) -> BenchServer:
         time the camera opens until the server restarts. Needs Linux/v4l2 for real cameras.
         """
         return bv.set_control(cam, control, value)
+
+    @mcp.tool()
+    @_guard
+    def show(image_path: str, caption: str, marks: list[dict] | None = None) -> str:
+        """Put an image on the wall display (left 2/3), with a caption bar underneath.
+
+        image_path: the image_path from a capture/capture_region/capture_cell/grid/compare reply.
+        caption: one line, e.g. "J5 cold joint: reflow with fresh flux".
+        marks: optional list of {kind, x, y, w, h, text, color} in that image's FULL-RESOLUTION
+            pixel coordinates (the frame size the capture reply states). kind is
+            circle (around box x,y,w,h, or centred on x,y), box (x,y,w,h), arrow (points AT x,y;
+            w,h = offset back to its tail) or label (text at x,y). color: red, yellow, green, cyan,
+            magenta, white, orange, blue or #rrggbb. Text goes beside its mark where it covers nothing;
+            otherwise the mark gets a number and the text is listed in a legend below the image.
+            An annotated copy is saved next to the original.
+        """
+        return bv.show(image_path, caption, marks)
+
+    @mcp.tool()
+    @_guard
+    def show_compare(left_path: str, right_path: str, caption: str, left_label: str, right_label: str) -> str:
+        """Put two images side by side on the wall display, each labelled (e.g. reference_path vs image_path)."""
+        return bv.show_compare(left_path, right_path, caption, left_label, right_label)
+
+    @mcp.tool()
+    @_guard
+    def show_step(
+        title: str, body: str, image_path: str | None = None, marks: list[dict] | None = None,
+        progress: str | None = None,
+    ) -> str:
+        """Fill the wall display's step panel (right 1/3); it stays until replaced.
+
+        title: short and large ("Reflow J5"). body: 3-5 short lines (max 5). progress: e.g.
+        "joint 4 of 18". image_path/marks: optional image with marks, same format as show().
+        Call this before telling the user the step in chat.
+        """
+        return bv.show_step(title, body, image_path, marks, progress)
+
+    @mcp.tool()
+    @_guard
+    def show_clear(area: str = "all") -> str:
+        """Clear the wall display: area "all", "image" or "step"."""
+        return bv.show_clear(area)
 
     return mcp

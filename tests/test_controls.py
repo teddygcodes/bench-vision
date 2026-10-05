@@ -3,7 +3,6 @@ import json
 import sys
 import threading
 import time
-from pathlib import Path
 
 import numpy as np
 import pytest
@@ -12,7 +11,7 @@ from bench_vision import camera as camera_mod
 from bench_vision.app import BenchVision
 from bench_vision.camera import CameraManager, OpenCVBackend
 from bench_vision.config import CameraConfig, load_config
-from bench_vision.errors import BenchVisionError, CameraError
+from bench_vision.errors import CameraError
 from bench_vision.setup import run_setup
 from bench_vision.v4l2 import V4L2
 

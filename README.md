@@ -33,7 +33,7 @@ uv run bench-vision capture scope --mock
 ```
 
 It prints something like
-`scope: full frame 1920x1080 (rotation 0°), returned 1024x576. ... Saved captures/2026-10-05/scope_142233.jpg`
+`scope: full frame 1920x1080 (rotation 0°), returned 1024x576. ... image_path: captures/2026-10-05/scope_142233.jpg (full-resolution frame)`
 and the full-resolution still is now in `captures/`.
 
 Register the server with Claude Code. Run this **inside the `bench-vision` directory**: the
@@ -61,6 +61,76 @@ Claude will call `list_cameras`, `grid`, then `capture_cell` / `capture_region` 
 (Claude Code asks you to approve each bench-vision tool the first time it is used).
 The mock board has planted defects: J3-J4 bridged, J5 cold, J6 unsoldered, J7 insufficient,
 and a solder ball between J7 and J8.
+
+## Wall display
+
+Trying the display needs only `uv sync` (no cameras, no Claude Code). `bench-vision display` serves a page at <http://127.0.0.1:8765> for a monitor on the wall: the
+left two thirds show the image Claude is talking about (or two side by side) with a caption bar,
+the right third shows the current step. Claude drives it with `show`, `show_compare`,
+`show_step` and `show_clear`; updates appear within a second, no reload. If the display isn't
+running, those tools say so in one line and everything else keeps working.
+
+Try it in mock mode. In one terminal, inside `bench-vision`, start the display server and leave it
+running:
+
+```bash
+uv run bench-vision display
+```
+
+Open <http://127.0.0.1:8765> in a browser. In a second terminal, inside `bench-vision`, push a
+step (`bench-vision call` runs any tool once without Claude):
+
+```bash
+uv run bench-vision call show_step '{"title": "Hello from bench-vision", "body": "If you can read this,\nthe wall display works.", "progress": "step 1 of 1"}' --mock
+```
+
+The step panel on the right shows it immediately. To push an image with a circled spot, take a
+capture, then paste the path printed after `image_path:` (just the path, e.g.
+`captures/2026-10-05/scope_142233.jpg`; paths relative to `bench-vision` are fine) in place of
+`PASTE_IMAGE_PATH_HERE`:
+
+```bash
+uv run bench-vision call capture '{"cam": "scope"}' --mock
+uv run bench-vision call show '{"image_path": "PASTE_IMAGE_PATH_HERE", "caption": "J5 cold joint: reflow with fresh flux", "marks": [{"kind": "circle", "x": 1000, "y": 480, "w": 120, "h": 120, "text": "J5"}]}' --mock
+```
+
+(On the Linux box with real cameras, drop `--mock`.) Stop the display server with Ctrl-C.
+
+### Start on login (Ubuntu)
+
+On the mini PC, with the repo at `~/bench-vision` and `uv` at `~/.local/bin/uv` (check with
+`command -v uv`; if either differs, edit the two paths in `deploy/bench-vision-display.service`):
+
+```bash
+sudo snap install chromium
+mkdir -p ~/.config/systemd/user ~/.config/autostart
+cp deploy/bench-vision-display.service ~/.config/systemd/user/
+cp deploy/bench-vision-kiosk.desktop ~/.config/autostart/
+systemctl --user daemon-reload
+systemctl --user enable --now bench-vision-display.service
+```
+
+The service starts the display server when you log in; the autostart entry waits until the server
+answers, then opens Chromium fullscreen (`--kiosk`) on the page. Log out and back in to check.
+Leave kiosk mode with Alt+F4. (The autostart entry uses `wget`, which stock Ubuntu desktop
+includes; if not, `sudo apt install wget`.) To keep the screen from blanking, locking or
+suspending:
+
+```bash
+gsettings set org.gnome.desktop.session idle-delay 0
+gsettings set org.gnome.desktop.screensaver lock-enabled false
+gsettings set org.gnome.settings-daemon.plugins.power sleep-inactive-ac-type 'nothing'
+```
+
+If the wall monitor is a second screen, add `--ozone-platform=x11 --window-position=X,0` to the
+`chromium` command in `~/.config/autostart/bench-vision-kiosk.desktop`, where X is the width of the
+first screen in pixels (window placement is ignored under Wayland without the first flag).
+Check the server with `systemctl --user status bench-vision-display`. To use another port, change
+it in three places: add `--port PORT` to `ExecStart` in
+`~/.config/systemd/user/bench-vision-display.service` (then `systemctl --user daemon-reload` and
+`systemctl --user restart bench-vision-display`), replace both `8765`s in
+`~/.config/autostart/bench-vision-kiosk.desktop`, and set
+`[display] url = "http://127.0.0.1:PORT"` in `config.toml`.
 
 ## First run on the Linux box (real cameras)
 
@@ -114,6 +184,9 @@ for the focus lock automatically.
 [server]
 jpeg_quality = 85                 # JPEGs returned to Claude
 
+[display]
+url = "http://127.0.0.1:8765"     # where the show tools push to; match `bench-vision display --port` (default)
+
 [cameras.side]
 device = "/dev/v4l/by-id/usb-Arducam_..._video-index0"   # never bare /dev/videoN
 resolution = [3840, 2160]
@@ -139,9 +212,14 @@ every tool as one clear line naming the entry.
 | `save_reference(cam, name)` | Keep the current frame as a named reference |
 | `compare(cam, name)` | Reference and now side by side, plus an absdiff heatmap with numbered changed regions |
 | `set_control(cam, control, value)` | Set a v4l2 control (focus, exposure, gain); checked against the camera's control list |
+| `show(image_path, caption, marks=[])` | Put an image on the wall display, with circles/boxes/arrows/labels drawn at full-res coordinates |
+| `show_compare(left_path, right_path, caption, left_label, right_label)` | Two images side by side on the wall display |
+| `show_step(title, body, image_path=None, marks=[], progress=None)` | Fill the display's step panel (stays until replaced) |
+| `show_clear(area="all")` | Clear `all`, `image` or `step` |
 
 Coordinates are full-resolution pixels of the (rotated) frame; every reply states the frame
-size and the scale of the returned image. Only one camera is ever open at a time, opened
+size and the scale of the returned image, and ends with `image_path:` (the saved full-res frame,
+which `show` takes directly); `save_reference` and `compare` also give `reference_path:`. Only one camera is ever open at a time, opened
 lazily per call; opening times out after 5 s and each frame after 5 s.
 
 ## Files it writes
@@ -150,6 +228,8 @@ lazily per call; opening times out after 5 s and each frame after 5 s.
   tool call, with a sidecar (camera, controls, crop box, sizes). This history survives `/clear`.
 - `references/<cam>/<name>.png` + `.json`: saved references (`references-mock/` in mock mode).
 - `.bench-vision/`: the last grid per camera, so `capture_cell` survives a server restart.
+- `<image>.marked.jpg`: the annotated copy `show`/`show_step` draw marks on, next to the capture
+  (images from elsewhere, e.g. `mock/`, get theirs in today's `captures/` folder).
 
 All of these are git-ignored.
 

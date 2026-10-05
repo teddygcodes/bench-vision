@@ -203,7 +203,7 @@ def test_capture_survives_unwritable_captures_dir(root, clock):
     bv = BenchVision(root, mock=True, clock=clock)
     result = bv.capture("scope")
     assert isinstance(result[0], bytes)
-    assert "WARNING: this capture was not saved" in result[1]
+    assert "image_path: none (WARNING: this capture was not saved" in result[1]
 
 
 def test_repo_mock_images_work(clock, tmp_path):
@@ -485,3 +485,26 @@ def test_saved_capture_is_full_res_rotated_and_records_max_edge(bv, root):
     assert meta["full_res_size"] == [1080, 1920]
     assert meta["max_edge"] == 512 and meta["returned_size"] == [288, 512]
     assert meta["rotation"] == 90
+
+
+def test_every_image_tool_reports_its_image_path(bv, root):
+    """show() takes these paths directly: each must exist and be the saved full-res frame."""
+    import re
+
+    calls = [
+        ("capture", dict(cam="scope")),
+        ("capture_region", dict(cam="scope", x=0, y=0, w=100, h=100)),
+        ("grid", dict(cam="scope", rows=2, cols=2)),
+        ("capture_cell", dict(cam="scope", cell="A1")),
+        ("save_reference", dict(cam="scope", name="r")),
+        ("compare", dict(cam="scope", name="r")),
+    ]
+    for tool, args in calls:
+        err, content = call(bv, tool, **args)
+        text = text_of(content)
+        assert not err, (tool, text)
+        m = re.search(r"image_path: (\S+)", text)
+        assert m and (root / m.group(1)).is_file(), (tool, text)
+        if tool in ("save_reference", "compare"):
+            r = re.search(r"reference_path: (\S+)", text)
+            assert r and (root / r.group(1)).is_file(), (tool, text)

@@ -27,6 +27,8 @@ DEFAULT_MAX_EDGE = 1024
 REGION_LONG_EDGE = 768
 CONTROL_NAME_RE = re.compile(r"[a-z][a-z0-9_]{0,63}")
 CELL_RE = re.compile(r"^\s*([A-Za-z])\s*0*([1-9][0-9]{0,2})\s*$")
+DISPLAY_LONG_EDGE = 1920  # images sent to the wall display
+STEP_IMAGE_LONG_EDGE = 1024
 ARCHIVE_JPEG_QUALITY = 92  # captures/ keeps full resolution at high quality
 
 
@@ -47,6 +49,24 @@ def _mock_config(mock: MockBackend) -> Config:
         size = (img.shape[1], img.shape[0]) if img is not None else (0, 0)  # (0, 0) = unknown
         cams[name] = CameraConfig(name=name, device=f"mock:{name}", resolution=size)
     return Config(cameras=cams)
+
+
+def _check_text(value: Any, name: str, limit: int, required: bool) -> str | None:
+    if value is None or (isinstance(value, str) and not value.strip()):
+        if required:
+            raise BenchVisionError(f"{name} is required.")
+        return None
+    if not isinstance(value, str):
+        raise BenchVisionError(f"{name} must be text.")
+    if len(value) > limit:
+        raise BenchVisionError(f"{name} is {len(value)} characters; keep it under {limit} so it reads on the wall.")
+    return value.strip()
+
+
+def _one_line(value: str | None, name: str) -> str | None:
+    if value is not None and ("\n" in value or "\r" in value):
+        raise BenchVisionError(f"{name} must be one line (what's wrong, what to do).")
+    return value
 
 
 def _num(v: float, pct: bool = False) -> str:
@@ -133,10 +153,14 @@ class BenchVision:
         """Save the full-resolution image (BGR) to captures/; on failure, report it rather than fail."""
         try:
             jpeg = imaging.encode_jpeg(imaging.to_pil(full_res), ARCHIVE_JPEG_QUALITY)
-            return f"Saved {self._relpath(self.store.save(cam, jpeg, meta))}"
+            # Every image-producing tool ends its reply with this, so show() can use the path directly.
+            return f"image_path: {self._relpath(self.store.save(cam, jpeg, meta))} (full-resolution frame)"
         except OSError as e:
             log.error("could not save capture: %s", e)
-            return f"WARNING: this capture was not saved to {self._relpath(self.store.root)}/ ({e.strerror or e})."
+            return (
+                f"image_path: none (WARNING: this capture was not saved to {self._relpath(self.store.root)}/: "
+                f"{e.strerror or e})"
+            )
 
     def _frame(self, cam: str, rotate: int) -> tuple[CameraConfig, Frame, int, Any]:
         """Capture one frame; return (config, raw frame, effective rotation, rotated BGR image)."""
@@ -370,7 +394,7 @@ class BenchVision:
         text = (
             f"{cam}: saved reference '{name}' ({full_w}x{full_h}, rotation {rotation}°) to "
             f"{self._relpath(png)}.{replaced} Later, compare(cam=\"{cam}\", name=\"{name}\") diffs a fresh "
-            f"frame against it. Returned {out.size[0]}x{out.size[1]}. {saved}"
+            f"frame against it. Returned {out.size[0]}x{out.size[1]}. {saved}; reference_path: {self._relpath(png)}"
         )
         return [jpeg, text]
 
@@ -457,7 +481,7 @@ class BenchVision:
             f"y = y * {full_h / heat_out.size[1]:.3f}). Mean diff {_num(stats['mean_diff'])}/255; "
             f"{stats['changed_px']} px ({_num(stats['changed_pct'], pct=True)}%) changed by >= {imaging.DIFF_THRESHOLD} levels "
             f"after a light blur, counting groups of >= {imaging.MIN_CHANGED_PIXELS} px (isolated specks "
-            f"ignored).{where} {saved}"
+            f"ignored).{where} {saved}; reference_path: {self._relpath(self.references.path_of(cam, name))}"
         )
         return [pair_jpeg, heat_jpeg, text]
 
@@ -503,3 +527,131 @@ class BenchVision:
             f"'{cam}' opens until the server restarts; to keep it, add \"{control}={value}\" to the "
             f"[cameras.{cam}] v4l2_controls list in config.toml."
         )
+
+    # ------------------------------------------------------------- wall display
+
+    def _image_file(self, image_path: Any, what: str = "image_path") -> Path:
+        """Resolve a path from a tool reply (relative to the project root); must stay inside it."""
+        if not isinstance(image_path, str) or not image_path.strip():
+            raise BenchVisionError(f"{what} must be a path such as one returned in a capture reply's image_path.")
+        p = Path(image_path.strip())
+        p = (p if p.is_absolute() else self.root / p)
+        try:
+            resolved = p.resolve()
+            inside = resolved.is_relative_to(self.root.resolve())
+            exists = resolved.is_file()
+        except (OSError, RuntimeError, ValueError):  # ValueError: e.g. a NUL byte in the path
+            inside, exists = True, False  # unusable path: report it as not existing
+        shown = _short(image_path, 80)
+        if not inside:
+            raise BenchVisionError(f"{what} {shown} is outside the bench-vision folder; use a path from a capture reply.")
+        if not exists:
+            raise BenchVisionError(f"{what} {shown} does not exist; use the image_path from a capture reply.")
+        return resolved
+
+    def _load_marked(self, image_path: Any, marks: Any, what: str = "image_path") -> tuple[Any, Path | None, Path]:
+        """(PIL image with marks drawn, annotated copy path or None, source path)."""
+        from . import marks as marks_mod
+
+        src = self._image_file(image_path, what)
+        bgr = load_image_strict(src)
+        if bgr is None:
+            raise BenchVisionError(f"{what} {_short(image_path, 80)} is not a readable JPEG/PNG image.")
+        img = imaging.to_pil(bgr)
+        checked = marks_mod.validate(marks, *img.size)
+        if not checked:
+            return img, None, src
+        img = marks_mod.draw(img, checked)
+        try:
+            out = self._annotated_path(src)
+            jpeg = imaging.encode_jpeg(img, ARCHIVE_JPEG_QUALITY)
+            while True:  # exclusive create: two concurrent show() calls never share a file
+                try:
+                    with open(out, "xb") as f:
+                        f.write(jpeg)
+                    break
+                except FileExistsError:
+                    out = self._annotated_path(src)
+        except OSError as e:
+            log.error("could not save annotated copy: %s", e)
+            out = None
+        return img, out, src
+
+    def _annotated_path(self, src: Path) -> Path:
+        """<stem>.marked.jpg next to the original when it is a capture; _1, _2... if that exists.
+
+        Originals elsewhere (mock/, references) are not written next to: their copy goes into
+        today's captures/ folder so the repo and the reference store stay clean.
+        """
+        folder = src.parent
+        if not src.is_relative_to(self.store.root.resolve()):
+            folder = self.store.root / self.clock().strftime("%Y-%m-%d")
+            folder.mkdir(parents=True, exist_ok=True)
+        n, out = 0, folder / f"{src.stem}.marked.jpg"
+        while out.exists():
+            n += 1
+            out = folder / f"{src.stem}.marked_{n}.jpg"
+        return out
+
+    def _display_jpeg(self, img: Any, long_edge: int) -> str:
+        from .display_client import b64
+
+        return b64(imaging.encode_jpeg(imaging.fit_long_edge(img, long_edge), 85))
+
+    def _push(self, payload: dict[str, Any]) -> None:
+        from .display_client import push
+
+        push(self._ready().display_url, payload)
+
+    def show(self, image_path: str, caption: str, marks: Any = None) -> str:
+        self._ready()
+        caption = _one_line(_check_text(caption, "caption", 200, required=True), "caption")
+        img, marked, src = self._load_marked(image_path, marks)
+        saved = f" Annotated copy: {self._relpath(marked)}." if marked else ""
+        try:
+            self._push({"area": "image", "caption": caption,
+                        "images": [{"jpeg_b64": self._display_jpeg(img, DISPLAY_LONG_EDGE), "label": None}]})
+        except BenchVisionError as e:
+            raise BenchVisionError(f"{e}{saved}") from None
+        return f"Shown on the wall display: {self._relpath(src)} — {caption.rstrip('.')}.{saved}"
+
+    def show_compare(self, left_path: str, right_path: str, caption: str, left_label: str, right_label: str) -> str:
+        self._ready()
+        caption = _one_line(_check_text(caption, "caption", 200, required=True), "caption")
+        labels = [_check_text(left_label, "left_label", 60, required=True),
+                  _check_text(right_label, "right_label", 60, required=True)]
+        images = [self._load_marked(p, None, what)[0] for p, what in ((left_path, "left_path"), (right_path, "right_path"))]
+        self._push({"area": "image", "caption": caption,
+                    "images": [{"jpeg_b64": self._display_jpeg(im, DISPLAY_LONG_EDGE), "label": lab}
+                               for im, lab in zip(images, labels)]})
+        return f"Shown side by side on the wall display: {labels[0]} | {labels[1]} — {caption.rstrip('.')}."
+
+    def show_step(self, title: str, body: str, image_path: str | None = None, marks: Any = None,
+                  progress: str | None = None) -> str:
+        self._ready()
+        title = _one_line(_check_text(title, "title", 80, required=True), "title")
+        body = _check_text(body, "body", 500, required=True)
+        lines = [ln for ln in body.splitlines() if ln.strip()]
+        if len(lines) > 5:
+            raise BenchVisionError(f"body has {len(lines)} lines; keep a step to 3-5 short lines so it reads from 3 ft.")
+        progress = _check_text(progress, "progress", 60, required=False)
+        if image_path is None and marks:
+            raise BenchVisionError("marks need an image_path to draw on.")
+        payload: dict[str, Any] = {"area": "step", "title": title, "body": body, "progress": progress}
+        saved = ""
+        if image_path is not None:
+            img, marked, _ = self._load_marked(image_path, marks)
+            payload["image_jpeg_b64"] = self._display_jpeg(img, STEP_IMAGE_LONG_EDGE)
+            saved = f" Annotated copy: {self._relpath(marked)}." if marked else ""
+        try:
+            self._push(payload)
+        except BenchVisionError as e:
+            raise BenchVisionError(f"{e}{saved}") from None
+        return f"Step shown on the wall display: {title}{f' ({progress})' if progress else ''}.{saved}"
+
+    def show_clear(self, area: str = "all") -> str:
+        self._ready()
+        if area not in ("all", "image", "step"):
+            raise BenchVisionError(f"area must be 'all', 'image' or 'step'; got {_short(area, 20)}.")
+        self._push({"area": "clear", "which": area})
+        return f"Cleared the wall display ({area})."

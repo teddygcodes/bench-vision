@@ -14,8 +14,10 @@ BY_ID_PREFIX = "/dev/v4l/by-id/"
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
 CONTROL_RE = re.compile(r"^\s*([a-z][a-z0-9_]*)\s*=\s*(-?\d+)\s*$")
 
-TOP_LEVEL_KEYS = {"cameras", "server"}
+TOP_LEVEL_KEYS = {"cameras", "server", "display"}
 SERVER_KEYS = {"jpeg_quality"}
+DISPLAY_KEYS = {"url"}
+DEFAULT_DISPLAY_URL = "http://127.0.0.1:8765"
 CAMERA_KEYS = {"device", "resolution", "fourcc", "default_rotation", "warmup_frames", "v4l2_controls"}
 
 
@@ -35,6 +37,7 @@ class CameraConfig:
 class Config:
     cameras: dict[str, CameraConfig]
     jpeg_quality: int = 85
+    display_url: str = DEFAULT_DISPLAY_URL
     path: Path | None = None
 
 
@@ -147,7 +150,18 @@ def parse_config(data: dict, where: str = "config.toml", path: Path | None = Non
             )
         seen[cam.device] = cam.name
 
-    return Config(cameras=cameras, jpeg_quality=quality, path=path)
+    display = data.get("display", {})
+    if not isinstance(display, dict):
+        raise ConfigError(f"{where} [display]: expected a table.")
+    _check_keys(f"{where} [display]", display, DISPLAY_KEYS)
+    url = display.get("url", DEFAULT_DISPLAY_URL)
+    if not isinstance(url, str) or not re.fullmatch(r"http://[^\s/:]+(:\d{1,5})?/?", url):
+        raise ConfigError(
+            f"{where} [display]: 'url' must look like \"http://127.0.0.1:8765\" (plain http: the display "
+            f"server doesn't speak https), got {url!r}."
+        )
+
+    return Config(cameras=cameras, jpeg_quality=quality, path=path, display_url=url.rstrip("/"))
 
 
 def load_config(path: Path, mock: bool = False) -> Config:

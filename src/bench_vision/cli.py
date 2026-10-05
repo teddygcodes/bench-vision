@@ -66,6 +66,86 @@ def _capture(args: argparse.Namespace) -> int:
     return 0
 
 
+def _port(text: str) -> int:
+    try:
+        value = int(text)
+    except ValueError:
+        value = -1
+    if not 1 <= value <= 65535:
+        raise argparse.ArgumentTypeError(f"must be a port number 1-65535, got {text!r}")
+    return value
+
+
+def _display(args: argparse.Namespace) -> int:
+    from .display import make_server
+
+    try:
+        server, _ = make_server(args.host, args.port)
+    except OSError as e:
+        import errno
+
+        hint = " (is another display already running?)" if e.errno == errno.EADDRINUSE else ""
+        print(f"bench-vision display: cannot listen on {args.host}:{args.port}: {e.strerror or e}{hint}",
+              file=sys.stderr)
+        return 2
+    print(f"bench-vision display: open http://{args.host}:{args.port} (Ctrl-C to stop)", file=sys.stderr)
+    server.serve_forever()
+    return 0
+
+
+def _call(args: argparse.Namespace) -> int:
+    """Run any MCP tool once, in-process, without Claude: `bench-vision call show_step '{"title": ...}'`."""
+    import asyncio
+    import base64
+    import json
+
+    os.environ["OPENCV_LOG_LEVEL"] = "WARNING"
+    logging.getLogger("mcp").setLevel(logging.WARNING)
+    logging.getLogger("bench_vision").setLevel(logging.CRITICAL)
+    from mcp import Client
+
+    from .app import BenchVision
+    from .server import build_server
+
+    try:
+        arguments = json.loads(args.arguments) if args.arguments else {}
+    except ValueError as e:
+        print(f"bench-vision call: arguments must be a JSON object: {e}", file=sys.stderr)
+        return 2
+    if not isinstance(arguments, dict):
+        print("bench-vision call: arguments must be a JSON object, e.g. '{\"cam\": \"scope\"}'", file=sys.stderr)
+        return 2
+    bv = BenchVision(Path(args.root).resolve(), mock=args.mock,
+                     config_path=Path(args.config).resolve() if args.config else None)
+
+    async def go():
+        async with Client(build_server(bv)) as client:
+            names = {t.name for t in (await client.list_tools()).tools}
+            if args.tool not in names:
+                return None, sorted(names)
+            return await client.call_tool(args.tool, arguments), None
+
+    result, names = asyncio.run(go())
+    if result is None:
+        print(f"bench-vision call: no tool {args.tool!r}; tools: {', '.join(names)}", file=sys.stderr)
+        return 2
+    text = "\n".join(c.text for c in result.content if c.type == "text")
+    if result.is_error:
+        print(f"bench-vision call: {text.removeprefix(f'Error executing tool {args.tool}: ')}", file=sys.stderr)
+        return 1
+    images = [c for c in result.content if c.type == "image"]
+    if images and args.out:
+        try:
+            Path(args.out).write_bytes(base64.b64decode(images[0].data))
+            text += f"\n(first returned image written to {args.out})"
+        except OSError as e:
+            print(text)
+            print(f"bench-vision call: could not write --out {args.out}: {e.strerror or e}", file=sys.stderr)
+            return 1
+    print(text)
+    return 0
+
+
 def _setup(args: argparse.Namespace) -> int:
     from .errors import BenchVisionError
     from .setup import run_setup
@@ -95,6 +175,20 @@ def main(argv: list[str] | None = None) -> int:
     cap.add_argument("--config", help="config file (default: <root>/config.toml)")
     cap.add_argument("--out", help="also write the returned (downscaled) JPEG here")
     cap.set_defaults(func=_capture)
+
+    disp = sub.add_parser("display", help="serve the wall-display page (open it in Chromium --kiosk)")
+    disp.add_argument("--host", default="127.0.0.1", help="address to listen on (default 127.0.0.1)")
+    disp.add_argument("--port", type=_port, default=8765, help="port (default 8765)")
+    disp.set_defaults(func=_display)
+
+    callp = sub.add_parser("call", help="run any MCP tool once without Claude, e.g. show_step")
+    callp.add_argument("tool", help="tool name, e.g. show_step, capture, list_cameras")
+    callp.add_argument("arguments", nargs="?", help="JSON object of arguments, e.g. '{\"cam\": \"scope\"}'")
+    callp.add_argument("--mock", action="store_true", help="use the images in ./mock/ instead of cameras")
+    callp.add_argument("--root", default=".", help="project directory holding config.toml, mock/, captures/")
+    callp.add_argument("--config", help="config file (default: <root>/config.toml)")
+    callp.add_argument("--out", help="write the first returned image here")
+    callp.set_defaults(func=_call)
 
     setup = sub.add_parser("setup", help="list cameras, print a diagnostic report, write a starter config.toml")
     setup.add_argument("--root", default=".", help="directory to write config.toml into")

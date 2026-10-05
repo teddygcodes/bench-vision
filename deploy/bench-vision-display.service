@@ -1,0 +1,14 @@
+# systemd user service: runs the wall-display server for your login session.
+# Install: see README "Wall display" -> "Start on login (Ubuntu)".
+# Assumes the repo is at ~/bench-vision and uv at ~/.local/bin/uv; edit both paths if not.
+[Unit]
+Description=bench-vision wall display server
+
+[Service]
+WorkingDirectory=%h/bench-vision
+ExecStart=%h/.local/bin/uv run bench-vision display
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target

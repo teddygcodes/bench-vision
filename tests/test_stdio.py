@@ -59,7 +59,7 @@ def test_capture_cli_mock(root, capsys):
     out = root / "x.jpg"
     assert main(["capture", "scope", "--mock", "--root", str(root), "--out", str(out)]) == 0
     text = capsys.readouterr().out
-    assert "scope: full frame 1920x1080" in text and "Saved captures/" in text
+    assert "scope: full frame 1920x1080" in text and "image_path: captures/" in text
     assert jpeg_size(out.read_bytes()) == (1024, 576)
 
 

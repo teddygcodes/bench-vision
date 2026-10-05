@@ -4,6 +4,9 @@
 [server]
 jpeg_quality = 85            # quality of JPEGs returned to Claude (captures/ keeps full res at 92)
 
+[display]
+url = "http://127.0.0.1:8765"  # where the show tools push to; match `bench-vision display --port`
+
 [cameras.scope]              # TOMLOV TM3K-AF Max in "PC Camera" mode, straight down
 device = "/dev/v4l/by-id/usb-REPLACE_ME_TOMLOV-video-index0"
 resolution = [1920, 1080]
