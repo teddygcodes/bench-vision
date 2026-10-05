@@ -18,7 +18,9 @@ log = logging.getLogger(__name__)
 INSTRUCTIONS = """\
 Eyes on a soldering bench. Typically 'scope' (microscope, straight down) and 'side'
 (low oblique from the left, shows fillet profile and the iron); call list_cameras for the
-actual set, then capture for an overview. capture reports the full-resolution frame size."""
+actual set, then capture (or grid) for an overview and capture_region / capture_cell to
+zoom in. Region coordinates are full-resolution pixels of the rotated frame; every reply
+states the frame size and the scale from the returned image."""
 
 
 def _to_content(result: Result | str) -> list[Image | str] | str:
@@ -92,5 +94,41 @@ def build_server(bv: BenchVision) -> BenchServer:
         max_edge: long edge of the returned image; keep the default unless you need more.
         """
         return bv.capture(cam, rotate, max_edge)
+
+    @mcp.tool()
+    @_guard
+    def capture_region(
+        cam: str, x: int, y: int, w: int, h: int, rotate: int = 0, max_edge: int = 768
+    ) -> list[Image | str]:
+        """Main inspection tool: crop a fresh full-resolution frame and zoom it.
+
+        x, y, w, h: top-left corner and size in FULL-RESOLUTION pixels of the rotated
+            frame (capture/grid report the frame size and the scale from their images).
+            Boxes partly outside the frame are clipped; the reply says so.
+        rotate: extra clockwise rotation (multiple of 90) added to the camera default;
+            use the same value as the capture you measured on.
+        max_edge: the crop is scaled (up or down) so its long edge is this many px.
+        """
+        return bv.capture_region(cam, x, y, w, h, rotate, max_edge)
+
+    @mcp.tool()
+    @_guard
+    def grid(cam: str, rows: int, cols: int, rotate: int = 0, max_edge: int = 1024) -> list[Image | str]:
+        """Capture the full frame with a labeled rows x cols grid (A1 = top-left).
+
+        Rows are letters A.., columns numbers 1... The grid is remembered per camera
+        so the user can say "look at B3" and you call capture_cell(cam, "B3").
+        """
+        return bv.grid(cam, rows, cols, rotate, max_edge)
+
+    @mcp.tool()
+    @_guard
+    def capture_cell(cam: str, cell: str, max_edge: int = 768, margin: float = 0.0) -> list[Image | str]:
+        """capture_region for one cell (e.g. "B3") of the last grid drawn on this camera.
+
+        margin: extra border as a fraction of the cell size on each side (e.g. 0.25),
+            useful when a joint straddles a grid line.
+        """
+        return bv.capture_cell(cam, cell, max_edge, margin)
 
     return mcp

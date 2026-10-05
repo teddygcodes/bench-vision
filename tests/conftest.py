@@ -13,8 +13,13 @@ from bench_vision.server import build_server
 
 
 def make_image(path: Path, w: int, h: int, seed: int = 0) -> np.ndarray:
-    rng = np.random.default_rng(seed)
-    img = rng.integers(0, 255, (h, w, 3), dtype=np.uint8)
+    # Smooth gradients (cheap to JPEG-encode at full res, unlike noise), tinted per seed.
+    xs = np.linspace(0, 255, w, dtype=np.float32)[None, :]
+    ys = np.linspace(0, 255, h, dtype=np.float32)[:, None]
+    img = np.empty((h, w, 3), np.uint8)
+    img[..., 0] = (ys * 0.8).astype(np.uint8)  # B
+    img[..., 1] = (xs * 0.8).astype(np.uint8)  # G
+    img[..., 2] = (seed * 37) % 120  # R
     # a distinct marker in the top-left quadrant so crops/rotations are checkable
     img[: h // 4, : w // 4] = (0, 0, 255)
     path.parent.mkdir(parents=True, exist_ok=True)

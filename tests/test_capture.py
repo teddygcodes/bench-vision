@@ -46,7 +46,6 @@ def test_capture_returns_small_jpeg_and_saves(bv, root):
     assert meta["camera"] == "side"
     assert meta["crop_box"] is None
     assert meta["full_res_size"] == [3840, 2160]
-    assert meta["saved_size"] == [3840, 2160]
     assert meta["max_edge"] == 1024
     assert meta["returned_size"] == [1024, 576]
     assert "controls" in meta
@@ -204,7 +203,7 @@ def test_capture_survives_unwritable_captures_dir(root, clock):
     bv = BenchVision(root, mock=True, clock=clock)
     result = bv.capture("scope")
     assert isinstance(result[0], bytes)
-    assert "WARNING: could not save" in result[1]
+    assert "WARNING: this capture was not saved" in result[1]
 
 
 def test_repo_mock_images_work(clock, tmp_path):

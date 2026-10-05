@@ -1,4 +1,4 @@
-"""Persist every image returned to the client under ./captures/YYYY-MM-DD/."""
+"""Persist the full-resolution image behind every tool call under ./captures/YYYY-MM-DD/."""
 
 from __future__ import annotations
 
