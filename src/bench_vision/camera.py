@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import logging
 import os
+import queue
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol
 
 import cv2
 import numpy as np
@@ -15,11 +16,15 @@ from PIL import Image as PILImage
 
 from .config import NAME_RE, CameraConfig
 from .errors import CameraError
-from .v4l2 import V4L2, ControlInfo, validate_control
+from .v4l2 import SUBPROCESS_TIMEOUT, V4L2, ControlInfo, validate_control
 
 log = logging.getLogger(__name__)
 
 MOCK_EXTS = (".jpg", ".jpeg", ".png")
+OPEN_TIMEOUT = 5.0  # seconds for the device to open
+FRAME_TIMEOUT = 5.0  # seconds for each frame
+RELEASE_TIMEOUT = 5.0  # seconds to wait for the device to close after a capture
+LOCK_TIMEOUT = 90.0  # longest a capture waits for another one to finish
 
 
 @dataclass
@@ -44,6 +49,11 @@ class Backend(Protocol):
     def set_ctrl(self, cam: CameraConfig, name: str, value: int) -> int | None: ...
 
 
+def is_auto_switch(name: str) -> bool:
+    """Controls that switch an automatic mode on/off and gate other controls (e.g. focus_absolute)."""
+    return name.endswith("_auto") or "automatic" in name or name.startswith("auto_")
+
+
 def missing_device_error(cam: CameraConfig) -> CameraError:
     return CameraError(
         f"Camera '{cam.name}' is not connected: {cam.source} [cameras.{cam.name}] device = "
@@ -57,6 +67,7 @@ class OpenCVBackend:
 
     def __init__(self, v4l2: V4L2 | None = None):
         self.v4l2 = v4l2 or V4L2()
+        self._worker: tuple[str, threading.Thread] | None = None  # last capture thread (may be stuck)
 
     def device_present(self, cam: CameraConfig) -> bool:
         try:
@@ -65,11 +76,15 @@ class OpenCVBackend:
             return False
 
     def list_ctrls(self, cam: CameraConfig) -> dict[str, ControlInfo]:
+        self.v4l2.require()  # "needs Linux/v4l2" comes before "not connected"
         if not self.device_present(cam):
             raise missing_device_error(cam)
         return self.v4l2.list_ctrls(cam.device)
 
     def set_ctrl(self, cam: CameraConfig, name: str, value: int) -> int | None:
+        self.v4l2.require()
+        if not self.device_present(cam):
+            raise missing_device_error(cam)
         self.v4l2.set_ctrl(cam.device, name, value)
         return self.v4l2.get_ctrl(cam.device, name)
 
@@ -80,10 +95,13 @@ class OpenCVBackend:
         applied: dict[str, int] = {}
         # Order matters: e.g. focus_automatic_continuous=0 must precede focus_absolute.
         for name, value in controls:
-            validate_control(available, name, value, f"{cam.source} [cameras.{cam.name}] v4l2_controls")
+            info = validate_control(available, name, value, f"{cam.source} [cameras.{cam.name}] v4l2_controls")
+            if info.inactive:  # e.g. focus_absolute while autofocus is on: the driver would refuse it
+                log.warning("camera %s: skipping %s=%s (inactive while its auto mode is on)", cam.name, name, value)
+                continue
             self.v4l2.set_ctrl(cam.device, name, value)
             applied[name] = value
-            if name.endswith("_auto") or "automatic" in name or name == "auto_exposure":
+            if is_auto_switch(name):
                 # Dependent controls become active only after the auto mode changes.
                 available = self.v4l2.list_ctrls(cam.device)
         return applied
@@ -102,39 +120,90 @@ class OpenCVBackend:
             ) from None
 
     def _grab(self, cam: CameraConfig, controls: list[tuple[str, int]]) -> Frame:
+        if self._worker is not None and self._worker[1].is_alive():
+            raise CameraError(
+                f"Camera '{self._worker[0]}' is still stuck in an earlier capture that timed out, so no camera "
+                "can be opened safely. Unplug and replug it, or restart the bench-vision server."
+            )
         if not self.device_present(cam):
             raise missing_device_error(cam)
         real = str(Path(cam.device).resolve())
-        cap = cv2.VideoCapture(real, cv2.CAP_V4L2)
+        events: queue.Queue = queue.Queue()
+        abandon = threading.Event()
+
+        def work() -> None:
+            # Runs the blocking OpenCV calls so the caller can give up on a hung device.
+            cap = None
+            try:
+                cap = cv2.VideoCapture(real, cv2.CAP_V4L2)
+                events.put(("opened", cap.isOpened()))
+                if not cap.isOpened() or abandon.is_set():
+                    return
+                cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*cam.fourcc))
+                cap.set(cv2.CAP_PROP_FRAME_WIDTH, cam.resolution[0])
+                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, cam.resolution[1])
+                events.put(("controls", self._apply_controls(cam, controls)))
+                for _ in range(cam.warmup_frames):
+                    if abandon.is_set():
+                        return
+                    ok, img = cap.read()
+                    events.put(("frame", img if ok and img is not None and img.size > 0 else None))
+            except BaseException as e:  # noqa: BLE001 - handed to the caller
+                events.put(("error", e))
+            finally:
+                if cap is not None:
+                    cap.release()
+                events.put(("released", None))
+
+        worker = threading.Thread(target=work, name=f"capture-{cam.name}", daemon=True)
+        self._worker = (cam.name, worker)
+        worker.start()
+
+        def wait(expect: str, timeout: float, what: str) -> Any:
+            try:
+                kind, value = events.get(timeout=timeout)
+            except queue.Empty:
+                nonlocal timed_out
+                timed_out = True
+                abandon.set()
+                raise CameraError(
+                    f"Camera '{cam.name}' ({cam.device}) did not {what} within {timeout:g} s; it may be hung. "
+                    "Unplug and replug it."
+                ) from None
+            if kind == "error":
+                raise value
+            if kind != expect:  # worker ended early (e.g. could not open)
+                return None
+            return value
+
+        timed_out = False
         try:
-            if not cap.isOpened():
+            if not wait("opened", OPEN_TIMEOUT, "open"):
                 raise CameraError(
                     f"Camera '{cam.name}' ({cam.device}) exists but could not be opened. "
                     "Is another program (cheese, OBS, a second bench-vision) using it, and is your "
                     "user in the 'video' group?"
                 )
-            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*cam.fourcc))
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH, cam.resolution[0])
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, cam.resolution[1])
-            applied = self._apply_controls(cam, controls)
+            # Each v4l2-ctl call has its own timeout; allow for all of them.
+            applied = wait("controls", OPEN_TIMEOUT + 2 * SUBPROCESS_TIMEOUT * (len(controls) + 1), "accept its controls")
             frame = None
             for _ in range(cam.warmup_frames):
-                ok, img = cap.read()
-                if ok and img is not None and img.size > 0:
+                img = wait("frame", FRAME_TIMEOUT, "deliver a frame")
+                if img is not None:
                     frame = img
-            if frame is None:
-                raise CameraError(
-                    f"Camera '{cam.name}' ({cam.device}) opened but returned no frames. "
-                    "Try unplugging it, or lower [cameras.{0}] resolution.".format(cam.name)
-                )
-            h, w = frame.shape[:2]
-            if (w, h) != cam.resolution:
-                log.warning(
-                    "camera %s: requested %sx%s, got %sx%s", cam.name, *cam.resolution, w, h
-                )
-            return Frame(cam.name, frame, applied)
         finally:
-            cap.release()
+            # Don't let the next capture start until this device is really closed. After a timeout
+            # the worker is hung, so don't wait: the next capture refuses while it is still alive.
+            worker.join(0 if timed_out else RELEASE_TIMEOUT)
+        if frame is None:
+            raise CameraError(
+                f"Camera '{cam.name}' ({cam.device}) opened but returned no frames. "
+                f"Try unplugging it, or lower [cameras.{cam.name}] resolution."
+            )
+        h, w = frame.shape[:2]
+        if (w, h) != cam.resolution:
+            log.warning("camera %s: requested %sx%s, got %sx%s", cam.name, *cam.resolution, w, h)
+        return Frame(cam.name, frame, applied or {})
 
 
 # Controls a mock camera pretends to have, so set_control is testable offline.
@@ -230,8 +299,17 @@ class MockBackend:
     def list_ctrls(self, cam: CameraConfig) -> dict[str, ControlInfo]:
         self._require(cam)
         vals = self._values.get(cam.name, {})
+
+        def flags(n: str) -> str:
+            # Like real UVC cameras: manual values are inactive while the auto mode is on.
+            if n == "focus_absolute" and vals.get("focus_automatic_continuous", 1) == 1:
+                return "inactive"
+            if n == "exposure_time_absolute" and vals.get("auto_exposure", 3) not in (1, 2):  # manual, shutter prio
+                return "inactive"
+            return ""
+
         ctrls = {
-            n: ControlInfo(c.name, c.type, c.min, c.max, c.step, c.default, vals.get(n, c.value))
+            n: ControlInfo(c.name, c.type, c.min, c.max, c.step, c.default, vals.get(n, c.value), flags(n))
             for n, c in MOCK_CONTROLS.items()
         }
         for n, v in cam.v4l2_controls:  # whatever a real config names exists here too
@@ -279,21 +357,24 @@ class CameraManager:
         return cam
 
     def controls_for(self, cam: CameraConfig) -> list[tuple[str, int]]:
-        merged = dict(cam.v4l2_controls)
-        merged.update(self.overrides.get(cam.name, {}))
-        # Keep config order (auto-mode switches first), then any new overrides.
-        order = [n for n, _ in cam.v4l2_controls] + [
-            n for n in self.overrides.get(cam.name, {}) if n not in dict(cam.v4l2_controls)
-        ]
-        return [(n, merged[n]) for n in order]
+        overrides = dict(self.overrides.get(cam.name, {}))  # snapshot: set_control may edit concurrently
+        # Config controls without an override (config order), then overrides (the order they were set),
+        # then a stable sort that puts auto-mode switches first: a manual value is only accepted by
+        # the driver once its auto mode is off, e.g. after a replug reset the camera to auto.
+        ordered = [(n, v) for n, v in cam.v4l2_controls if n not in overrides] + list(overrides.items())
+        return sorted(ordered, key=lambda nv: not is_auto_switch(nv[0]))
 
     def capture(self, name: str) -> Frame:
         cam = self.get(name)
-        with self._lock:
+        if not self._lock.acquire(timeout=LOCK_TIMEOUT):
+            raise CameraError(
+                f"Camera '{name}' is waiting on another capture that has not finished after {LOCK_TIMEOUT:g} s."
+            )
+        try:
             self.open_camera = name
-            try:
-                frame = self.backend.grab(cam, self.controls_for(cam))
-            finally:
-                self.open_camera = None
+            frame = self.backend.grab(cam, self.controls_for(cam))
+        finally:
+            self.open_camera = None
+            self._lock.release()  # always, even if the grab failed or timed out
         self.last_size[name] = frame.size
         return frame

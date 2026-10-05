@@ -19,9 +19,10 @@ INSTRUCTIONS = """\
 Eyes on a soldering bench. Typically 'scope' (microscope, straight down) and 'side'
 (low oblique from the left, shows fillet profile and the iron); call list_cameras for the
 actual set, then capture (or grid) for an overview and capture_region / capture_cell to
-zoom in. save_reference before rework and compare afterwards to see
-what changed. Region coordinates are full-resolution pixels of the rotated frame; every reply
-states the frame size and the scale from the returned image."""
+zoom in. save_reference before rework and compare afterwards to see what changed.
+set_control adjusts focus/exposure/gain (real cameras need Linux/v4l2). Region
+coordinates are full-resolution pixels of the rotated frame; every reply states the
+frame size and the scale from the returned image."""
 
 
 def _to_content(result: Result | str) -> list[Image | str] | str:
@@ -149,5 +150,17 @@ def build_server(bv: BenchVision) -> BenchServer:
         then an absdiff heatmap, plus the largest changed regions in full-res pixels.
         No alignment is done (the cameras are fixed on booms)."""
         return bv.compare(cam, name, max_edge)
+
+    @mcp.tool()
+    @_guard
+    def set_control(cam: str, control: str, value: int) -> str:
+        """Set a camera control via v4l2-ctl (e.g. focus_absolute, exposure_time_absolute, gain).
+
+        The name is checked against the camera's --list-ctrls; an unknown name lists the
+        available ones with their ranges. Manual focus/exposure need their auto mode off
+        first (focus_automatic_continuous=0, auto_exposure=1). The value is re-applied each
+        time the camera opens until the server restarts. Needs Linux/v4l2 for real cameras.
+        """
+        return bv.set_control(cam, control, value)
 
     return mcp

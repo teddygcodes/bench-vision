@@ -25,6 +25,17 @@ def _serve(args: argparse.Namespace) -> int:
     return 0
 
 
+def _setup(args: argparse.Namespace) -> int:
+    from .errors import BenchVisionError
+    from .setup import run_setup
+
+    try:
+        return run_setup(Path(args.root).resolve(), force=args.force)
+    except BenchVisionError as e:
+        print(f"bench-vision setup: {e}", file=sys.stderr)
+        return 2
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="bench-vision", description="MCP server for soldering-bench cameras.")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -34,6 +45,11 @@ def main(argv: list[str] | None = None) -> int:
     serve.add_argument("--root", default=".", help="project directory holding config.toml, mock/, captures/")
     serve.add_argument("--config", help="config file (default: <root>/config.toml)")
     serve.set_defaults(func=_serve)
+
+    setup = sub.add_parser("setup", help="list cameras, print a diagnostic report, write a starter config.toml")
+    setup.add_argument("--root", default=".", help="directory to write config.toml into")
+    setup.add_argument("--force", action="store_true", help="overwrite an existing config.toml")
+    setup.set_defaults(func=_setup)
 
     args = parser.parse_args(argv)
     # stdout is the MCP channel; all logging goes to stderr.

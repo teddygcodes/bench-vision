@@ -16,6 +16,7 @@ from .errors import BenchVisionError, ConfigError
 from .grid_state import GridStore
 from .references import ReferenceStore, check_name
 from .storage import CaptureStore
+from .v4l2 import validate_control
 
 log = logging.getLogger(__name__)
 
@@ -24,6 +25,7 @@ Result = list[Union[bytes, str]]
 
 DEFAULT_MAX_EDGE = 1024
 REGION_LONG_EDGE = 768
+CONTROL_NAME_RE = re.compile(r"[a-z][a-z0-9_]{0,63}")
 CELL_RE = re.compile(r"^\s*([A-Za-z])\s*0*([1-9][0-9]{0,2})\s*$")
 ARCHIVE_JPEG_QUALITY = 92  # captures/ keeps full resolution at high quality
 
@@ -458,3 +460,40 @@ class BenchVision:
             f"ignored).{where} {saved}"
         )
         return [pair_jpeg, heat_jpeg, text]
+
+    # -------------------------------------------------------------- controls
+
+    def set_control(self, cam: str, control: str, value: int) -> str:
+        self._ready()
+        cfg = self.cameras.get(cam)
+        if not isinstance(control, str) or not CONTROL_NAME_RE.fullmatch(control):
+            raise BenchVisionError(
+                f"control must be a v4l2 control name like 'focus_absolute' or 'gain'; got {_short(control, 40)}."
+            )
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise BenchVisionError(f"value must be an integer; got {_short(value, 40)}.")
+        controls = self.cameras.backend.list_ctrls(cfg)  # needs Linux/v4l2 for real cameras
+        info = validate_control(controls, control, value, f"set_control on '{cam}'")
+        if info.inactive:
+            hint = {
+                "focus_absolute": "set focus_automatic_continuous=0 first",
+                "exposure_time_absolute": "set auto_exposure=1 (manual) first",
+            }.get(control, "turn off the matching automatic control first")
+            raise BenchVisionError(f"{control} is inactive on '{cam}' right now; {hint}.")
+        before = info.value
+        after = self.cameras.backend.set_ctrl(cfg, control, value)
+        overrides = self.cameras.overrides.setdefault(cam, {})
+        overrides[control] = value
+        dropped = ""
+        # Turning an auto mode back on makes its manual value inactive; stop re-applying it.
+        dependent = {"focus_automatic_continuous": ("focus_absolute", lambda v: v == 1),
+                     "auto_exposure": ("exposure_time_absolute", lambda v: v not in (1, 2))}.get(control)
+        if dependent and dependent[1](value) and overrides.pop(dependent[0], None) is not None:
+            dropped = f" (stopped re-applying {dependent[0]}, which is inactive in this mode)"
+        rng = f"{info.min}..{info.max}" if info.min is not None and info.max is not None else "?"
+        readback = f", camera now reports {after}" if after is not None and after != value else ""
+        return (
+            f"{cam}: {control} set to {value} (was {before}; range {rng}{readback}){dropped}. It is re-applied every time "
+            f"'{cam}' opens until the server restarts; to keep it, add \"{control}={value}\" to the "
+            f"[cameras.{cam}] v4l2_controls list in config.toml."
+        )
