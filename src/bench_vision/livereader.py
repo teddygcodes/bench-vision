@@ -1,12 +1,16 @@
 """Child process that reads the live camera for `bench-vision display`.
 
-    python -m bench_vision.livereader --root DIR [--mock] [--config FILE] --cam NAME
+    python -m bench_vision.livereader --root DIR [--mock] [--config FILE] --cam NAME [--attempt N]
 
 Writes frames to stdout as <4-byte big-endian length><JPEG>, at most MAX_FPS, rotated like
-captures and scaled to a LONG_EDGE long edge. On an error it prints one line to stderr and exits
-with status 3. It exits when stdin closes (the display went away). The display kills this process
-to free the camera for a capture, so the kernel has closed the device before the camera lock is
-released.
+captures and scaled to a LONG_EDGE long edge. If the camera is missing, won't open, or stops
+delivering frames (unplugged), it prints a `status: unavailable: ...` line to stderr and tries
+again itself after RETRY_DELAYS (3 s, 6 s, 12 s, 24 s, then every 30 s; back to 3 s once frames
+flow), so the display doesn't start a new process for each attempt. --attempt continues the back-off
+of a reader the display stopped for a capture. Errors no retry can fix (bad
+config, unknown camera) print one line and exit with status 3. It exits when stdin closes (the
+display went away). The display kills this process to free the camera for a capture, so the kernel
+has closed the device before the camera lock is released.
 """
 
 from __future__ import annotations
@@ -22,6 +26,18 @@ from pathlib import Path
 LONG_EDGE = 960
 MAX_FPS = 15.0
 NO_FRAMES = 3.0  # seconds of failed reads before the reader reports the camera gone
+RETRY_DELAYS = (3.0, 6.0, 12.0, 24.0, 30.0)  # waits between attempts to (re)open; the last repeats
+PRESENCE_CHECK = 1.0  # seconds between checks for a replugged camera while waiting to retry
+STATUS = "status: "  # stderr lines with this prefix set the display's live-view status
+
+
+def retry_delay(attempt: int) -> float:
+    """Wait before retry number `attempt` (0-based)."""
+    return RETRY_DELAYS[min(attempt, len(RETRY_DELAYS) - 1)]
+
+
+def _say(line: str) -> None:
+    print(line, file=sys.stderr, flush=True)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -30,6 +46,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--cam", required=True)
     p.add_argument("--mock", action="store_true")
     p.add_argument("--config")
+    p.add_argument("--attempt", type=int, default=0)
     args = p.parse_args(argv)
     os.environ["OPENCV_LOG_LEVEL"] = "WARNING"
 
@@ -57,52 +74,83 @@ def main(argv: list[str] | None = None) -> int:
         if bv.config_error is not None:
             raise bv.config_error
         cam = bv.cameras.get(args.cam)
-        bv.load_shared_overrides()
-        stream = bv.cameras.backend.open_stream(cam, bv.cameras.controls_for(cam))
     except BenchVisionError as e:
-        print(str(e), file=sys.stderr, flush=True)
+        _say(str(e))
         return 3
     except Exception as e:  # noqa: BLE001 - reported as a status line, not a traceback
-        print(f"internal error ({type(e).__name__})", file=sys.stderr, flush=True)
+        _say(f"internal error ({type(e).__name__})")
         return 3
-    next_at = 0.0
-    failing_since: float | None = None
-    try:
-        while True:
-            img = stream.read()
-            if img is None:
-                # e.g. unplugged: read() fails at once, so don't spin; give up after NO_FRAMES seconds
-                now = time.monotonic()
-                failing_since = failing_since or now
-                if now - failing_since > NO_FRAMES:
-                    print(f"Camera '{cam.name}' stopped delivering frames (unplugged?).", file=sys.stderr, flush=True)
-                    return 3
-                time.sleep(0.05)
-                continue
-            failing_since = None
-            img = imaging.rotate(img, cam.default_rotation)
-            h, w = img.shape[:2]
-            scale = LONG_EDGE / max(h, w)
-            if scale < 1:
-                img = cv2.resize(img, (max(1, round(w * scale)), max(1, round(h * scale))),
-                                 interpolation=cv2.INTER_AREA)
-            ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 75])
-            if ok:
-                data = buf.tobytes()
-                out.write(struct.pack(">I", len(data)) + data)
-                out.flush()
-            next_at = max(next_at + 1.0 / MAX_FPS, time.monotonic())
-            time.sleep(max(0.0, next_at - time.monotonic()))
-    except (BrokenPipeError, OSError):
-        return 0
-    except Exception as e:  # noqa: BLE001
-        print(f"camera stopped: {type(e).__name__}: {str(e)[:120]}", file=sys.stderr, flush=True)
-        return 3
-    finally:
+
+    def present() -> bool:
         try:
-            stream.close()
+            return bv.cameras.backend.device_present(cam)
         except Exception:  # noqa: BLE001
-            pass
+            return False
+
+    def unavailable(why: str, attempt: int) -> None:
+        _say(f"{STATUS}unavailable: {' '.join(why.split())} (retrying in {retry_delay(attempt):g} s)")
+        # Sleep, but retry at once if a missing device reappears (replugged) instead of waiting up to 30 s.
+        missing = not present()
+        end = time.monotonic() + retry_delay(attempt)
+        while time.monotonic() < end:
+            time.sleep(min(PRESENCE_CHECK, max(0.0, end - time.monotonic())))
+            if missing and present():
+                return
+
+    attempt = max(0, args.attempt)
+    while True:
+        try:
+            bv.load_shared_overrides()  # pick up set_control values made since the last attempt
+            stream = bv.cameras.backend.open_stream(cam, bv.cameras.controls_for(cam))
+        except BenchVisionError as e:
+            unavailable(str(e), attempt)
+            attempt += 1
+            continue
+        except Exception as e:  # noqa: BLE001
+            unavailable(f"could not open the camera ({type(e).__name__})", attempt)
+            attempt += 1
+            continue
+        why = None
+        next_at = 0.0
+        failing_since: float | None = None
+        try:
+            while True:
+                img = stream.read()
+                if img is None:
+                    # e.g. unplugged: read() fails at once, so don't spin; give up after NO_FRAMES seconds
+                    now = time.monotonic()
+                    failing_since = failing_since or now
+                    if now - failing_since > NO_FRAMES:
+                        why = f"Camera '{cam.name}' stopped delivering frames (unplugged?)."
+                        break
+                    time.sleep(0.05)
+                    continue
+                failing_since = None
+                attempt = 0  # frames flow again: the next failure starts the back-off from the beginning
+                img = imaging.rotate(img, cam.default_rotation)
+                h, w = img.shape[:2]
+                scale = LONG_EDGE / max(h, w)
+                if scale < 1:
+                    img = cv2.resize(img, (max(1, round(w * scale)), max(1, round(h * scale))),
+                                     interpolation=cv2.INTER_AREA)
+                ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 75])
+                if ok:
+                    data = buf.tobytes()
+                    out.write(struct.pack(">I", len(data)) + data)
+                    out.flush()
+                next_at = max(next_at + 1.0 / MAX_FPS, time.monotonic())
+                time.sleep(max(0.0, next_at - time.monotonic()))
+        except BrokenPipeError:
+            return 0  # the display went away
+        except Exception as e:  # noqa: BLE001
+            why = f"camera stopped ({type(e).__name__})"
+        finally:
+            try:
+                stream.close()
+            except Exception:  # noqa: BLE001
+                pass
+        unavailable(why, attempt)
+        attempt += 1
 
 
 if __name__ == "__main__":

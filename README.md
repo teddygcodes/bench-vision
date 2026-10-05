@@ -104,7 +104,8 @@ When nothing has been pushed with `show` for 20 seconds (`[display] live_idle_se
 `show_clear` with `{"area": "image"}`, the image area shows a live view of the `scope` camera
 (`[display] live_camera`) at up to 15 fps. It only runs while the page is open, stays on this
 machine (nothing from it goes to Claude), and hands the camera to Claude's capture tools whenever
-they need it, within half a second. `set_target` draws a box on it. Run the display and the MCP
+they need it, within half a second. If the camera is missing or unplugged, the image area says so and
+the live view tries again after 3 s, 6 s, 12 s and so on, up to every 30 s. `set_target` draws a box on it. Run the display and the MCP
 server from the same `bench-vision` folder: they share the camera hand-over and the board files.
 
 A board is a reference image plus the joints on it. With the display from above still running

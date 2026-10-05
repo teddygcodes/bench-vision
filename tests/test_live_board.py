@@ -477,39 +477,148 @@ def test_live_reader_uses_set_control_values_of_a_running_server(root, clock):
     stale = BenchVision(root, mock=True)
     stale.load_shared_overrides()
     assert stale.cameras.overrides == {}
+    reader.load_shared_overrides()  # a long-lived reader drops the values of a server that has exited
+    assert reader.cameras.overrides == {}
 
 
-def test_live_reader_reports_a_missing_camera_in_one_clear_line(root):
+FAST_RETRY = "(0.2, 0.4, 0.8)"
+
+
+def _start_reader(root, *extra, patch=""):
+    """The real reader as the display runs it (stdin kept open), with short back-off delays."""
+    import subprocess
+    import sys
+
+    code = (f"import os, sys; from bench_vision import livereader, camera; livereader.RETRY_DELAYS = {FAST_RETRY}; "
+            f"livereader.NO_FRAMES = 0.3; {patch or 'pass'}; c = livereader.main(); sys.stderr.flush(); os._exit(c)")
+    return subprocess.Popen([sys.executable, "-c", code, "--root", str(root), "--cam", "scope", *extra],
+                            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+
+def _lines_with_times(stream, n, timeout):
+    got, done = [], threading.Event()
+
+    def read():
+        for raw in stream:
+            got.append((time.monotonic(), raw.decode().strip()))
+            if len(got) >= n:
+                break
+        done.set()
+
+    threading.Thread(target=read, daemon=True).start()
+    done.wait(timeout)
+    return got
+
+
+def test_retry_delays_back_off_to_thirty_seconds():
+    from bench_vision.livereader import retry_delay
+
+    assert [retry_delay(i) for i in range(7)] == [3, 6, 12, 24, 30, 30, 30]
+
+
+def test_live_reader_retries_a_missing_camera_itself_with_back_off(root):
+    (root / "config.toml").write_text('[cameras.scope]\ndevice = "/dev/v4l/by-id/not-plugged-in"\n')
+    proc = _start_reader(root)
+    try:
+        lines = _lines_with_times(proc.stderr, 4, timeout=30)
+        assert proc.poll() is None  # the same process keeps trying: no exit, no respawn
+    finally:
+        proc.kill()
+    texts = [t for _, t in lines]
+    assert len(texts) == 4 and all(t.startswith("status: unavailable: Camera 'scope' is not connected") for t in texts)
+    assert [t.rsplit("(retrying in ", 1)[1] for t in texts] == ["0.2 s)", "0.4 s)", "0.8 s)", "0.8 s)"]
+    gaps = [b - a for (a, _), (b, _) in zip(lines, lines[1:])]
+    assert gaps[0] < gaps[1] < gaps[2] + 0.1 and gaps[1] > 0.3
+
+
+def test_live_reader_continues_back_off_after_restart(root):
+    (root / "config.toml").write_text('[cameras.scope]\ndevice = "/dev/v4l/by-id/not-plugged-in"\n')
+    proc = _start_reader(root, "--attempt", "2")
+    try:
+        lines = _lines_with_times(proc.stderr, 1, timeout=30)
+    finally:
+        proc.kill()
+    assert lines and lines[0][1].endswith("(retrying in 0.8 s)")
+
+
+def test_live_reader_resumes_in_the_same_process_when_the_camera_returns(root):
+    import shutil
+
+    (root / "config.toml").write_text('[cameras.scope]\ndevice = "/dev/v4l/by-id/scope-video-index0"\n')
+    shutil.move(root / "mock" / "scope.png", root / "scope.png")  # camera "unplugged" at start
+    # a long back-off: the replug must still be noticed within about a second, not after 30 s
+    proc = _start_reader(root, "--mock", patch="livereader.RETRY_DELAYS = (30.0,); livereader.PRESENCE_CHECK = 0.2")
+    try:
+        first = _lines_with_times(proc.stderr, 1, timeout=30)
+        assert first and "unavailable" in first[0][1] and first[0][1].endswith("(retrying in 30 s)")
+        shutil.move(root / "scope.png", root / "mock" / "scope.png")  # plugged back in
+        head = []
+        reader = threading.Thread(target=lambda: head.append(proc.stdout.read(4)), daemon=True)
+        reader.start()
+        reader.join(10)
+        assert head and len(head[0]) == 4 and proc.poll() is None  # a frame from the same process
+    finally:
+        proc.kill()
+
+
+def test_live_reader_reports_a_camera_that_stops_delivering_and_retries(root):
+    proc = _start_reader(root, "--mock", patch="camera.MockStream.read = lambda self: None")
+    try:
+        lines = _lines_with_times(proc.stderr, 2, timeout=30)
+        assert proc.poll() is None
+    finally:
+        proc.kill()
+    texts = [t for _, t in lines]
+    assert len(texts) == 2 and all("stopped delivering frames (unplugged?)" in t for t in texts)
+    assert "Fatal" not in " ".join(texts)
+
+
+def test_live_reader_exits_once_on_a_config_error(root):
+    (root / "config.toml").write_text('[cameras.scope]\ndevice = 5\n')
+    proc = _start_reader(root)
+    try:
+        rc = proc.wait(timeout=30)
+    finally:
+        proc.kill()
+    err = proc.stderr.read().decode().strip().splitlines()
+    assert rc == 3 and err and "'device' is required" in err[-1]
+    assert not any(e.startswith("status:") or "Fatal" in e or "Traceback" in e for e in err)
+
+
+def test_display_starts_one_reader_for_a_missing_camera_and_shows_status(root, monkeypatch):
     import subprocess
     import sys
 
     (root / "config.toml").write_text('[cameras.scope]\ndevice = "/dev/v4l/by-id/not-plugged-in"\n')
-    proc = subprocess.Popen([sys.executable, "-m", "bench_vision.livereader", "--root", str(root), "--cam", "scope"],
-                            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    code = (f"import os, sys; from bench_vision import livereader; livereader.RETRY_DELAYS = {FAST_RETRY}; "
+            "c = livereader.main(); sys.stderr.flush(); os._exit(c)")
+    spawned = []
+    real_popen = subprocess.Popen
+
+    def popen(cmd, **kw):
+        spawned.append(cmd)
+        return real_popen(cmd, **kw)
+
+    monkeypatch.setattr(live_mod.subprocess, "Popen", popen)
+    stream = LiveStream([sys.executable, "-c", code, "--root", str(root), "--cam", "scope"],
+                        CameraLock(root / ".bench-vision"))
+    token = stream.attach()
     try:
-        proc.wait(timeout=30)  # stdin stays open, as under the display (closing it means "exit now")
+        deadline = time.monotonic() + 15
+        while "retrying in 0.8 s" not in stream.status and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert stream.status.startswith("unavailable: Camera 'scope' is not connected")
+        assert len(spawned) == 1 and spawned[0][-2:] == ["--attempt", "0"]
+        # a capture interrupts the reader; the next one carries on with the back-off
+        with CameraLock(root / ".bench-vision").for_capture("side"):
+            pass
+        deadline = time.monotonic() + 10
+        while len(spawned) < 2 and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert len(spawned) == 2 and int(spawned[1][-1]) >= 3
     finally:
-        proc.kill()
-    err = proc.stderr.read()
-    lines = err.decode().strip().splitlines()
-    assert proc.returncode == 3, err
-    assert lines and "Camera 'scope' is not connected" in lines[-1] and "Fatal" not in err.decode()
-
-
-def test_live_reader_gives_up_when_the_camera_stops_delivering(root):
-    import subprocess
-    import sys
-
-    code = ("import os, sys; from bench_vision import livereader, camera; livereader.NO_FRAMES = 0.5; "
-            "camera.MockStream.read = lambda self: None; c = livereader.main(); sys.stderr.flush(); os._exit(c)")
-    proc = subprocess.Popen([sys.executable, "-c", code, "--root", str(root), "--cam", "scope", "--mock"],
-                            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    try:
-        rc = proc.wait(timeout=20)  # stdin stays open: it must exit on its own
-    finally:
-        proc.kill()
-    err = proc.stderr.read().decode()
-    assert rc == 3 and "stopped delivering frames" in err
+        stream.detach(token)
+        time.sleep(live_mod.IDLE_STOP + 0.5)
 
 
 def test_reader_stderr_flood_does_not_stall_the_stream(tmp_path):

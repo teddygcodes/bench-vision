@@ -99,7 +99,6 @@ triggering another review round; none affects results, data, or error handling.
 - record_verdict crops the joint whenever the image has the board reference's size, even if it came from another camera.
 - Joint ids up to 24 characters wrap to several lines in the verdict strip and shrink the live view at 1280x720.
 - While the display server is down, the page keeps the LIVE badge on the frozen frame (the offline banner explains it).
-- With a missing live camera, the status alternates between "starting" and "unavailable" every 3 s, so the page text flickers.
 - A reader that prints garbage instead of frames leaves the status at "starting".
 - A reader stuck in the kernel past the 0.9 s kill wait has the lock released anyway; the capture may then fail with "device busy" (never blocked), and only the display's log says why.
 - A hand-edited board whose joint lacks x/y/w/h makes board_set(active) report "internal error (KeyError)" rather than "corrupt board".
@@ -108,5 +107,5 @@ triggering another review round; none affects results, data, or error handling.
 - Two MCP servers on one root overwrite each other's set_control values in controls.json; the live reader uses the last writer's.
 - After a reader dies from a signal, the status may show its last stderr line (a warning) rather than "camera reader exited (-9)".
 - The live-view open error lacks the capture error's "another program / video group?" hint.
-- A missing live camera is retried every 3 s (a fresh Python + cv2 import each time) while a page watches; ~4% CPU on a Mac, more on a small box. Could back off.
 - Run by hand with stdin closed, the reader exits 0 silently; with stdin = /dev/zero its watcher spins. Under the display stdin is always a pipe.
+- Each capture during a live-view back-off both retries the camera at once and moves the back-off one step on, so a few captures take the wait to 30 s (a replug is still noticed within ~1 s).

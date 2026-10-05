@@ -7,6 +7,8 @@ viewer leaves), it terminates the reader, kills it if it hasn't exited after STO
 releases the lock once the process is gone: the kernel has closed the device by then, so a
 capture never runs while the live view still has a camera open, and never waits on a stuck
 reader for more than ~STOP_GRACE + KILL_WAIT (well inside camlock.CAPTURE_WAIT).
+A missing or unplugged camera is retried inside the reader with back-off (3 s up to 30 s; its
+`status:` stderr lines set the status), so no new process is started per attempt.
 Frames go only to the local page, never to the model.
 """
 
@@ -20,6 +22,7 @@ import time
 from typing import Any
 
 from .camlock import CameraLock
+from .livereader import STATUS, retry_delay
 
 log = logging.getLogger(__name__)
 
@@ -27,7 +30,6 @@ POLL = 0.02  # how often the lock-wanted flag and the reader are checked
 STOP_GRACE = 0.3  # seconds after SIGTERM before SIGKILL
 KILL_WAIT = 0.9  # seconds to wait for a killed reader to be reaped (a reader stuck in the kernel may linger)
 IDLE_STOP = 2.0  # stop the camera this long after the last viewer leaves
-RETRY = 3.0  # seconds between attempts when the camera can't be opened
 MAX_VIEWERS = 4  # more MJPEG connections than this: the oldest is dropped (browsers can leak them)
 
 
@@ -44,6 +46,7 @@ class LiveStream:
         self._next_token = 0
         self._last_viewer = 0.0
         self._thread: threading.Thread | None = None
+        self._attempts = 0  # failed opens reported by readers since the last frame (carried across readers)
         self._fixed_unavailable = unavailable is not None or command is None
         self.on_status: Any = None  # set by the display server to refresh pages when the status changes
 
@@ -116,20 +119,26 @@ class LiveStream:
                 if len(data) < n:
                     return
                 self._publish(data)
+                self._attempts = 0
                 self._set_status("live")
         except (OSError, ValueError):
             return
 
-    @staticmethod
-    def _drain_stderr(proc: subprocess.Popen, last: list[str]) -> None:
+    def _drain_stderr(self, proc: subprocess.Popen, last: list[str]) -> None:
         """Read the reader's stderr as it comes (libjpeg/V4L2 warnings would otherwise fill the pipe and
-        stall it), keeping the last line for the status."""
+        stall it). `status: ...` lines set the status at once (the reader retries a missing camera
+        itself); the last other line explains an exit."""
         try:
             for raw in proc.stderr:
-                line = raw.decode("utf-8", "replace").strip()
-                if line:
-                    last[0] = line[:300]
-                    log.debug("live reader: %s", line[:300])
+                line = raw.decode("utf-8", "replace").strip()[:300]
+                if line.startswith(STATUS):
+                    status = line[len(STATUS):]
+                    if status.startswith("unavailable"):
+                        self._attempts += 1
+                    self._set_status(status)
+                elif line:
+                    last[0] = line
+                    log.debug("live reader: %s", line)
         except (OSError, ValueError):
             return
 
@@ -152,6 +161,7 @@ class LiveStream:
 
     def _run(self) -> None:
         assert self.command is not None
+        failures = 0  # reader exits in a row without a frame: back off like the reader does
         while self._watched():
             if not self.lock.try_acquire_low():
                 self._set_status("paused for a capture")
@@ -159,15 +169,16 @@ class LiveStream:
                 continue
             proc = None
             error = None
+            seq0 = self.seq
             try:
-                proc = subprocess.Popen(self.command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                proc = subprocess.Popen(self.command + ["--attempt", str(self._attempts)], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                         stderr=subprocess.PIPE)
                 threading.Thread(target=self._read_frames, args=(proc,), daemon=True).start()
                 last_err = [""]
                 drain = threading.Thread(target=self._drain_stderr, args=(proc, last_err), daemon=True)
                 drain.start()
-                if self.status != "live":
-                    self._set_status("starting")
+                if self.status != "live" and not self.status.startswith("unavailable"):
+                    self._set_status("starting")  # (while backing off, keep saying why until frames come)
                 while self._watched() and not self.lock.wanted() and proc.poll() is None:
                     time.sleep(POLL)
                 if proc.poll() is not None and not self.lock.wanted():
@@ -180,9 +191,13 @@ class LiveStream:
                 if proc is not None:
                     self._stop(proc)
                 self.lock.release()  # only now: the reader (and its open device) is gone
+            if self.seq != seq0:
+                failures = 0
             if error:
-                self._set_status(f"unavailable: {error}")
-                end = time.monotonic() + RETRY
+                delay = retry_delay(failures)
+                failures += 1
+                self._set_status(f"unavailable: {error} (retrying in {delay:g} s)")
+                end = time.monotonic() + delay
                 while time.monotonic() < end and self._watched():
                     time.sleep(0.1)
         self._set_status("stopped (no viewers)")

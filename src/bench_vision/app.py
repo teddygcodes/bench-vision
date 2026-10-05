@@ -556,8 +556,11 @@ class BenchVision:
         return self.root / ".bench-vision" / (f"{CONTROLS_FILE[:-5]}-mock.json" if self.mock else CONTROLS_FILE)
 
     def load_shared_overrides(self) -> None:
-        """In the live reader: pick up set_control values from a running MCP server (see _save_overrides)."""
+        """In the live reader: use the set_control values of a running MCP server (see _save_overrides),
+        replacing any loaded earlier (that server may have exited since)."""
         from .camlock import _pid_alive
+
+        self.cameras.overrides = {}
 
         try:
             data = json.loads(self._controls_file().read_text(encoding="utf-8"))
