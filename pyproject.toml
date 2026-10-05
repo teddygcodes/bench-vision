@@ -1,0 +1,30 @@
+[project]
+name = "bench-vision"
+version = "0.1.0"
+description = "MCP server that gives Claude Code eyes on a soldering bench"
+authors = [
+    { name = "Tyler Gilstrap", email = "TYLERGILSTRAP10@gmail.com" }
+]
+requires-python = ">=3.11"
+dependencies = [
+    "mcp>=2.3.0",
+    "numpy>=2.4.6",
+    "opencv-python-headless>=5.0.0.93",
+    "pillow>=12.3.0",
+]
+
+[project.scripts]
+bench-vision = "bench_vision:main"
+
+[build-system]
+requires = ["uv_build>=0.11.31,<0.12.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src", "tests"]

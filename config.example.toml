@@ -1,0 +1,20 @@
+# Copy to config.toml, or generate one with `uv run bench-vision setup`.
+# Device paths must be stable /dev/v4l/by-id/ links, never bare /dev/videoN.
+
+[server]
+jpeg_quality = 85            # quality of JPEGs returned to Claude and saved to captures/
+
+[cameras.scope]              # TOMLOV TM3K-AF Max in "PC Camera" mode, straight down
+device = "/dev/v4l/by-id/usb-REPLACE_ME_TOMLOV-video-index0"
+resolution = [1920, 1080]
+fourcc = "MJPG"
+default_rotation = 0         # clockwise degrees: 0, 90, 180, 270
+v4l2_controls = []
+
+[cameras.side]               # Arducam 8MP autofocus, low oblique from the left
+device = "/dev/v4l/by-id/usb-REPLACE_ME_Arducam-video-index0"
+resolution = [3840, 2160]
+fourcc = "MJPG"
+default_rotation = 0
+# Applied in order every time the camera is opened. Autofocus off, then lock focus.
+v4l2_controls = ["focus_automatic_continuous=0", "focus_absolute=300"]
