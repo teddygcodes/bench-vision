@@ -7,11 +7,14 @@ authors = [
 ]
 requires-python = ">=3.11"
 dependencies = [
-    "mcp>=2.3.0",
+    "mcp==2.3.0",  # pinned: mcp 2.x API (MCPServer); bump deliberately
     "numpy>=2.4.6",
     "opencv-python-headless>=5.0.0.93",
     "pillow>=12.3.0",
 ]
+
+[project.urls]
+Repository = "https://github.com/teddygcodes/bench-vision"
 
 [project.scripts]
 bench-vision = "bench_vision:main"

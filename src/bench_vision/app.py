@@ -20,6 +20,7 @@ log = logging.getLogger(__name__)
 Result = list[Union[bytes, str]]
 
 DEFAULT_MAX_EDGE = 1024
+ARCHIVE_JPEG_QUALITY = 92  # captures/ keeps full resolution at high quality
 
 
 def _mock_config(mock: MockBackend) -> Config:
@@ -96,9 +97,10 @@ class BenchVision:
         except ValueError:
             return str(p)
 
-    def _save(self, cam: str, jpeg: bytes, meta: dict[str, Any]) -> str:
-        """Save to captures/; on failure, report it rather than losing the image."""
+    def _save(self, cam: str, full_res: Any, meta: dict[str, Any]) -> str:
+        """Save the full-resolution image (BGR) to captures/; on failure, report it rather than fail."""
         try:
+            jpeg = imaging.encode_jpeg(imaging.to_pil(full_res), ARCHIVE_JPEG_QUALITY)
             return f"Saved {self._relpath(self.store.save(cam, jpeg, meta))}"
         except OSError as e:
             log.error("could not save capture: %s", e)
@@ -113,13 +115,20 @@ class BenchVision:
         rotation = (cfg.default_rotation + rotate) % 360
         return cfg, frame, rotation, imaging.rotate(frame.image, rotation)
 
-    def _meta(self, cfg: CameraConfig, frame: Frame, rotation: int, **extra: Any) -> dict[str, Any]:
+    def _meta(
+        self, cfg: CameraConfig, frame: Frame, rotation: int, rotated: Any, saved: Any, returned: Any,
+        max_edge: int, **extra: Any,
+    ) -> dict[str, Any]:
+        """Sidecar contents. Sizes are [w, h]; full_res_size is the rotated full frame."""
         return {
             "device": cfg.device,
             "mock": self.mock,
             "controls": frame.controls,
             "rotation": rotation,
-            "frame_size": list(frame.size),
+            "full_res_size": [rotated.shape[1], rotated.shape[0]],
+            "saved_size": [saved.shape[1], saved.shape[0]],
+            "max_edge": max_edge,
+            "returned_size": list(returned.size),
             **extra,
         }
 
@@ -161,7 +170,7 @@ class BenchVision:
         jpeg = imaging.encode_jpeg(out, self._ready().jpeg_quality)
         sx, sy = full_w / out.size[0], full_h / out.size[1]
         saved = self._save(
-            cam, jpeg, self._meta(cfg, frame, rotation, tool="capture", crop_box=None, returned_size=list(out.size))
+            cam, img, self._meta(cfg, frame, rotation, img, img, out, max_edge, tool="capture", crop_box=None)
         )
         text = (
             f"{cam}: full frame {full_w}x{full_h} (rotation {rotation}°), returned {out.size[0]}x{out.size[1]}. "

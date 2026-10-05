@@ -57,7 +57,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "mcp", specifier = ">=2.3.0" },
+    { name = "mcp", specifier = "==2.3.0" },
     { name = "numpy", specifier = ">=2.4.6" },
     { name = "opencv-python-headless", specifier = ">=5.0.0.93" },
     { name = "pillow", specifier = ">=12.3.0" },

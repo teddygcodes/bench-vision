@@ -41,10 +41,14 @@ def test_capture_returns_small_jpeg_and_saves(bv, root):
     saved = sorted((root / "captures").rglob("*.jpg"))
     assert [p.name for p in saved] == ["side_120001.jpg"]
     assert saved[0].parent.name == "2026-10-04"
+    assert jpeg_size(saved[0].read_bytes()) == (3840, 2160)  # full resolution on disk
     meta = json.loads(saved[0].with_suffix(".json").read_text())
     assert meta["camera"] == "side"
     assert meta["crop_box"] is None
-    assert meta["frame_size"] == [3840, 2160]
+    assert meta["full_res_size"] == [3840, 2160]
+    assert meta["saved_size"] == [3840, 2160]
+    assert meta["max_edge"] == 1024
+    assert meta["returned_size"] == [1024, 576]
     assert "controls" in meta
 
 
@@ -470,3 +474,15 @@ def test_empty_frames_count_as_no_frames(tmp_path, monkeypatch):
     monkeypatch.setattr(camera.cv2, "VideoCapture", Cap)
     with pytest.raises(CameraError, match="returned no frames"):
         OpenCVBackend().grab(CameraConfig("side", str(dev)), [])
+
+
+def test_saved_capture_is_full_res_rotated_and_records_max_edge(bv, root):
+    err, content = call(bv, "capture", cam="scope", rotate=90, max_edge=512)
+    assert not err
+    assert jpeg_size(images_of(content)[0]) == (288, 512)
+    [saved] = list((root / "captures").rglob("*.jpg"))
+    assert jpeg_size(saved.read_bytes()) == (1080, 1920)
+    meta = json.loads(saved.with_suffix(".json").read_text())
+    assert meta["full_res_size"] == [1080, 1920]
+    assert meta["max_edge"] == 512 and meta["returned_size"] == [288, 512]
+    assert meta["rotation"] == 90
