@@ -14,6 +14,7 @@ from .camera import Backend, CameraManager, Frame, MockBackend, OpenCVBackend, l
 from .config import CameraConfig, Config, load_config
 from .errors import BenchVisionError, ConfigError
 from .grid_state import GridStore
+from .references import ReferenceStore, check_name
 from .storage import CaptureStore
 
 log = logging.getLogger(__name__)
@@ -42,8 +43,29 @@ def _mock_config(mock: MockBackend) -> Config:
         if img is None:
             log.warning("mock image for '%s' does not decode; its resolution is unknown", name)
         size = (img.shape[1], img.shape[0]) if img is not None else (0, 0)  # (0, 0) = unknown
-        cams[name] = CameraConfig(name=name, device=f"mock:{mock.mock_dir / name}", resolution=size)
+        cams[name] = CameraConfig(name=name, device=f"mock:{name}", resolution=size)
     return Config(cameras=cams)
+
+
+def _num(v: float, pct: bool = False) -> str:
+    """Fixed-point with enough decimals that small non-zero values never print as 0 or 1e-05."""
+    if v == 0:
+        return "0"
+    if v < 1e-6:
+        return "<0.000001"
+    for places in (1, 2, 3, 4, 5, 6):
+        if round(v, places) != 0:
+            text = f"{v:.{places}f}"
+            break
+    if pct and v < 100 and float(text) >= 100:  # e.g. 99.96%: don't claim every pixel changed
+        return ">99.9"
+    return text
+
+
+def _short(value: Any, limit: int = 60) -> str:
+    """A sidecar value echoed to the client, bounded and printable (sidecars can be hand-edited)."""
+    text = value if isinstance(value, str) and value.isprintable() else repr(value)
+    return text if len(text) <= limit else text[: limit - 3] + "..."
 
 
 class BenchVision:
@@ -88,6 +110,7 @@ class BenchVision:
         cams = self.config.cameras if self.config else {}
         self.cameras = CameraManager(cams, backend)
         # Kept out of captures/ (only images + sidecars there); mock and live never share grids.
+        self.references = ReferenceStore(root / ("references-mock" if mock else "references"))
         self.grids = GridStore(root / ".bench-vision" / ("grids-mock.json" if mock else "grids.json"))
 
     # ------------------------------------------------------------------ helpers
@@ -316,3 +339,122 @@ class BenchVision:
                 f"{grid['full_res_size'][0]}x{grid['full_res_size'][1]}; cells were scaled proportionally."
             )
         return result
+
+    # ------------------------------------------------------------ references
+
+    def save_reference(self, cam: str, name: str, rotate: int = 0, max_edge: int = DEFAULT_MAX_EDGE) -> Result:
+        self._ready()
+        self.cameras.get(cam)
+        name = check_name(name)
+        max_edge = imaging.check_max_edge(max_edge)
+        cfg, frame, rotation, img = self._frame(cam, rotate)
+        full_h, full_w = img.shape[:2]
+        stamp = self.clock().isoformat(timespec="seconds")
+        ref_meta = {
+            "camera": cam, "name": name, "saved_at": stamp, "device": cfg.device, "mock": self.mock,
+            "rotation": rotation, "full_res_size": [full_w, full_h], "controls": frame.controls,
+        }
+        png, previous = self.references.save(cam, name, img, ref_meta)
+        out = imaging.fit_long_edge(imaging.to_pil(img), max_edge)
+        jpeg = imaging.encode_jpeg(out, self._ready().jpeg_quality)
+        saved = self._save(cam, img, self._meta(cfg, frame, rotation, img, out, max_edge,
+                                                tool="save_reference", crop_box=None, reference=name))
+        if previous:
+            replaced = f" Replaced the reference saved {_short(previous.get('saved_at', 'earlier'))}."
+        elif previous is not None:
+            replaced = " Replaced an existing reference (its old sidecar was missing or unreadable)."
+        else:
+            replaced = ""
+        text = (
+            f"{cam}: saved reference '{name}' ({full_w}x{full_h}, rotation {rotation}°) to "
+            f"{self._relpath(png)}.{replaced} Later, compare(cam=\"{cam}\", name=\"{name}\") diffs a fresh "
+            f"frame against it. Returned {out.size[0]}x{out.size[1]}. {saved}"
+        )
+        return [jpeg, text]
+
+    def compare(self, cam: str, name: str, max_edge: int = DEFAULT_MAX_EDGE) -> Result:
+        self._ready()
+        cfg = self.cameras.get(cam)
+        name = check_name(name)
+        max_edge = imaging.check_max_edge(max_edge)
+        ref, ref_meta = self.references.load(cam, name)
+        ref_rotation = ref_meta.get("rotation", 0)
+        try:
+            ref_rotation = imaging.normalize_rotation(ref_rotation)
+        except BenchVisionError:
+            raise BenchVisionError(f"Reference '{name}' has an invalid rotation in its sidecar; save it again.") from None
+        # Capture in the reference's orientation so the two frames line up pixel for pixel.
+        cfg, frame, rotation, cur = self._frame(cam, (ref_rotation - cfg.default_rotation) % 360)
+        if cur.shape[:2] != ref.shape[:2]:
+            rh, rw = ref.shape[:2]
+            ch, cw = cur.shape[:2]
+            raise BenchVisionError(
+                f"Reference '{name}' is {rw}x{rh} but '{cam}' now delivers {cw}x{ch} (resolution or rotation "
+                f"changed). Save the reference again at the current settings."
+            )
+        heat_out, stats = imaging.diff_heatmap(ref, cur, max_edge)
+        full_h, full_w = cur.shape[:2]
+        pair = imaging.side_by_side(
+            imaging.to_pil(ref), imaging.to_pil(cur),
+            (f"REFERENCE '{name}'", "NOW"), max_edge,
+        )
+        q = self._ready().jpeg_quality
+        pair_jpeg = imaging.encode_jpeg(pair, q)
+        heat_jpeg = imaging.encode_jpeg(heat_out, max(q, 75), full_chroma=True)  # small warm marks must survive
+        saved = self._save(cam, cur, self._meta(cfg, frame, rotation, cur, heat_out, max_edge, tool="compare",
+                                                crop_box=None, reference=name,
+                                                reference_saved_at=ref_meta.get("saved_at"),
+                                                reference_sha256=ref_meta.get("pair_sha256"), diff=stats,
+                                                returned_sizes={"side_by_side": list(pair.size),
+                                                                "heatmap": list(heat_out.size)}))
+        n_boxes, n_areas = len(stats["regions"]), stats["region_count"]
+        plural = lambda n, word: f"{n} {word}{'' if n == 1 else 's'}"  # noqa: E731
+        if not n_boxes:
+            boxes = "no boxes"
+        elif stats["areas_in_regions"] == n_areas:
+            covered = {1: "the changed area", 2: "both changed areas"}.get(n_areas, f"all {n_areas} changed areas")
+            boxes = f"{n_boxes} box{'es' if n_boxes != 1 else ''} covering {covered}"
+        else:
+            boxes = (
+                f"boxes = the {n_boxes} largest of {stats['hint_count']} zoom regions, covering "
+                f"{stats['areas_in_regions']} of {plural(n_areas, 'changed area')}"
+            )
+        extra_rotate = (rotation - cfg.default_rotation) % 360
+        rot_arg = f", rotate={extra_rotate}" if extra_rotate else ""
+        if stats["regions"]:
+            regions = "; ".join(
+                f"#{i} x={x}, y={y}, w={w}, h={h}" for i, (x, y, w, h) in enumerate(stats["regions"], 1)
+            )
+            more = "" if stats["areas_in_regions"] == n_areas else f" ({plural(n_areas, 'changed area')} in total)"
+            where = (
+                f" {'Changed region' if n_boxes == 1 else 'Largest changed regions'} in this {full_w}x{full_h} "
+                "frame, outlined and numbered on the heatmap"
+                f"{more}: {regions} (inspect with capture_region(cam=\"{cam}\", x, y, w, h{rot_arg}))."
+            )
+        else:
+            where = " No changed regions above the noise threshold."
+        shift = stats["brightness_shift"]
+        if abs(shift) >= imaging.BRIGHTNESS_NOTE:
+            where += f" Median brightness is {abs(shift)} levels {'higher' if shift > 0 else 'lower'} than the reference."
+        where += (
+            " Caveat: absdiff can't tell rework from a moved board, a focus change or an exposure change; "
+            "if the heatmap lights up edges or bright areas all over, check those first."
+        )
+        if ref_meta.get("device") not in (None, cfg.device):
+            where += (
+                f" WARNING: this reference was saved from device {_short(ref_meta.get('device'))!r}, but "
+                f"'{cam}' is now {cfg.device!r}; differences may just be a different camera."
+            )
+        text = (
+            f"{cam}: compared now vs reference '{name}' saved {_short(ref_meta.get('saved_at', '?'))} "
+            f"({full_w}x{full_h}, rotation {rotation}°, no alignment). "
+            f"Image 1: reference | now side by side. Image 2: absdiff heatmap over the current frame "
+            f"(blue-cyan = not counted: below {imaging.DIFF_THRESHOLD} levels, or isolated specks under "
+            f"{imaging.MIN_CHANGED_PIXELS} px; yellow-red = counted changes; {boxes}; "
+            f"{heat_out.size[0]}x{heat_out.size[1]}, full-res x = x * {full_w / heat_out.size[0]:.3f}, "
+            f"y = y * {full_h / heat_out.size[1]:.3f}). Mean diff {_num(stats['mean_diff'])}/255; "
+            f"{stats['changed_px']} px ({_num(stats['changed_pct'], pct=True)}%) changed by >= {imaging.DIFF_THRESHOLD} levels "
+            f"after a light blur, counting groups of >= {imaging.MIN_CHANGED_PIXELS} px (isolated specks "
+            f"ignored).{where} {saved}"
+        )
+        return [pair_jpeg, heat_jpeg, text]

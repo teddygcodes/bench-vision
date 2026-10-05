@@ -19,7 +19,8 @@ INSTRUCTIONS = """\
 Eyes on a soldering bench. Typically 'scope' (microscope, straight down) and 'side'
 (low oblique from the left, shows fillet profile and the iron); call list_cameras for the
 actual set, then capture (or grid) for an overview and capture_region / capture_cell to
-zoom in. Region coordinates are full-resolution pixels of the rotated frame; every reply
+zoom in. save_reference before rework and compare afterwards to see
+what changed. Region coordinates are full-resolution pixels of the rotated frame; every reply
 states the frame size and the scale from the returned image."""
 
 
@@ -130,5 +131,23 @@ def build_server(bv: BenchVision) -> BenchServer:
             useful when a joint straddles a grid line.
         """
         return bv.capture_cell(cam, cell, max_edge, margin)
+
+    @mcp.tool()
+    @_guard
+    def save_reference(cam: str, name: str, rotate: int = 0, max_edge: int = 1024) -> list[Image | str]:
+        """Capture now and keep the full-resolution frame as a named reference (e.g. "u1-before").
+
+        Saving under an existing name replaces it. rotate works as in capture; compare
+        later captures in the same orientation.
+        """
+        return bv.save_reference(cam, name, rotate, max_edge)
+
+    @mcp.tool()
+    @_guard
+    def compare(cam: str, name: str, max_edge: int = 1024) -> list[Image | str]:
+        """Capture now and compare with a saved reference: returns reference|now side by side,
+        then an absdiff heatmap, plus the largest changed regions in full-res pixels.
+        No alignment is done (the cameras are fixed on booms)."""
+        return bv.compare(cam, name, max_edge)
 
     return mcp

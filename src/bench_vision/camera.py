@@ -203,7 +203,7 @@ class MockBackend:
                 return []
             for p in self.mock_dir.iterdir():
                 name = p.name if p.is_dir() else p.stem
-                if not NAME_RE.match(name):
+                if not NAME_RE.fullmatch(name):
                     log.warning("ignoring mock image %s: name must match %s", p, NAME_RE.pattern)
                 elif p.is_dir() or p.suffix.lower() in MOCK_EXTS:
                     try:

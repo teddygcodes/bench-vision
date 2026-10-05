@@ -53,7 +53,7 @@ def _check_keys(where: str, table: dict, allowed: set[str]) -> None:
 
 
 def parse_control(text: str, where: str) -> tuple[str, int]:
-    m = CONTROL_RE.match(text) if isinstance(text, str) else None
+    m = CONTROL_RE.fullmatch(text) if isinstance(text, str) else None
     if not m:
         raise ConfigError(
             f'{where}: v4l2_controls entry {text!r} is not of the form "name=integer", '
@@ -64,7 +64,7 @@ def parse_control(text: str, where: str) -> tuple[str, int]:
 
 def _parse_camera(name: str, raw: object, where_file: str) -> CameraConfig:
     where = f"{where_file} [cameras.{name}]"
-    if not NAME_RE.match(name):
+    if not NAME_RE.fullmatch(name):
         raise ConfigError(
             f"{where}: camera name '{name}' must be lowercase letters, digits, '-' or '_' "
             "(it is used in file names)."

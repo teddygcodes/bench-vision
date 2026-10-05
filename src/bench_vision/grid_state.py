@@ -19,15 +19,11 @@ import tempfile
 import threading
 import time
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 
 from . import imaging
 from .errors import BenchVisionError
-
-try:
-    import fcntl
-except ImportError:  # pragma: no cover - non-POSIX
-    fcntl = None  # type: ignore[assignment]
+from .locks import file_lock
 
 log = logging.getLogger(__name__)
 
@@ -60,7 +56,7 @@ def _clean(entry: Any) -> dict[str, Any] | None:
         "cols": entry["cols"],
         "rotation": rotation,
         "full_res_size": size if _valid_size(size) else None,
-        "drawn_at": drawn if isinstance(drawn, str) and DRAWN_AT_RE.match(drawn) else None,
+        "drawn_at": drawn if isinstance(drawn, str) and DRAWN_AT_RE.fullmatch(drawn) else None,
     }
 
 
@@ -81,40 +77,6 @@ class GridStore:
         else:
             if self._corrupt:
                 self.read_error = "corrupt file"
-
-    @contextlib.contextmanager
-    def _file_lock(self, deadline: float) -> Iterator[bool]:
-        """Cross-process lock. Yields False if another process holds it for more than
-        LOCK_TIMEOUT s; proceeds unlocked (yielding True) if the lock file itself is unusable."""
-        fd = None
-        if fcntl is not None:
-            try:
-                self.path.parent.mkdir(parents=True, exist_ok=True)
-                fd = os.open(self.path.with_suffix(".lock"), os.O_RDWR | os.O_CREAT | os.O_NONBLOCK, 0o644)
-            except OSError:
-                fd = None
-        if fd is not None:
-            while True:
-                try:
-                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    break
-                except BlockingIOError:
-                    if time.monotonic() >= deadline:
-                        os.close(fd)
-                        yield False
-                        return
-                    time.sleep(0.05)
-                except OSError:
-                    os.close(fd)
-                    fd = None
-                    break
-        try:
-            yield True
-        finally:
-            if fd is not None:
-                with contextlib.suppress(OSError):
-                    fcntl.flock(fd, fcntl.LOCK_UN)
-                os.close(fd)
 
     def _read_file(self) -> dict[str, dict[str, Any]]:
         """Valid entries from the file ({} if missing or corrupt); raises Unreadable."""
@@ -163,7 +125,7 @@ class GridStore:
             self._write_lock.release()
 
     def _write(self, cam: str, deadline: float) -> str:
-        with self._file_lock(deadline) as locked:
+        with file_lock(self.path.with_suffix(".lock"), deadline) as locked:
             if not locked:
                 log.error("timed out waiting for %s", self.path.with_suffix(".lock"))
                 return " WARNING: grid kept in memory only (state file busy in another process)."

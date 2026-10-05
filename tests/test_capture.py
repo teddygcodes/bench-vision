@@ -7,9 +7,9 @@ import numpy as np
 import pytest
 
 from bench_vision.app import BenchVision
-from bench_vision.camera import CameraManager, Frame, MockBackend, OpenCVBackend
+from bench_vision.camera import CameraManager, Frame, OpenCVBackend
 from bench_vision.config import CameraConfig
-from bench_vision.errors import BenchVisionError, CameraError
+from bench_vision.errors import CameraError
 
 from conftest import call, images_of, jpeg_size, list_tool_names, text_of
 
