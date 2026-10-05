@@ -21,7 +21,8 @@ Eyes on a soldering bench. Typically 'scope' (microscope, straight down) and 'si
 actual set, then capture (or grid) for an overview and capture_region / capture_cell to
 zoom in. save_reference before rework and compare afterwards to see what changed.
 set_control adjusts focus/exposure/gain (real cameras need Linux/v4l2). show / show_compare /
-show_step / show_clear drive the wall display (`bench-vision display`). Region
+show_step / show_clear drive the wall display (`bench-vision display`); board_init / board_set /
+record_verdict / set_target keep its board map, verdict strip and live-view reticle current. Region
 coordinates are full-resolution pixels of the rotated frame; every reply states the
 frame size and the scale from the returned image."""
 
@@ -206,5 +207,41 @@ def build_server(bv: BenchVision) -> BenchServer:
     def show_clear(area: str = "all") -> str:
         """Clear the wall display: area "all", "image" or "step"."""
         return bv.show_clear(area)
+
+    @mcp.tool()
+    @_guard
+    def set_target(cam: str, x: int, y: int, w: int, h: int, label: str = "") -> str:
+        """Draw a reticle box (with label) on the wall's live view, in that camera's full-resolution
+        coordinates at its default rotation. capture_region / capture_cell replies offer the call."""
+        return bv.set_target(cam, x, y, w, h, label)
+
+    @mcp.tool()
+    @_guard
+    def clear_target(cam: str) -> str:
+        """Remove the live-view reticle for a camera."""
+        return bv.clear_target(cam)
+
+    @mcp.tool()
+    @_guard
+    def board_init(name: str, image_path: str, joints: list[dict]) -> str:
+        """Record a board: a reference image (an image_path from a capture) and its joints as
+        [{"id": "J1", "x": .., "y": .., "w": .., "h": ..}] in that image's pixels. Saved to
+        boards/<name>.json; all joints start as todo; it becomes the board shown on the wall."""
+        return bv.board_init(name, image_path, joints)
+
+    @mcp.tool()
+    @_guard
+    def board_set(name: str, joint_id: str, state: str) -> str:
+        """Set a joint's state: todo, active, verified or flagged (only one active at a time; the
+        previous active joint goes back to todo). After making a joint active, call set_target."""
+        return bv.board_set(name, joint_id, state)
+
+    @mcp.tool()
+    @_guard
+    def record_verdict(joint_id: str, verdict: str, image_path: str, note: str = "") -> str:
+        """Log an inspection verdict for a joint of the current board (good, cold, insufficient, bridge,
+        lifted pad, unsoldered, solder ball, unsure) with the image it was judged from; shows on the
+        wall's verdict strip (green = good, red = anything else)."""
+        return bv.record_verdict(joint_id, verdict, image_path, note)
 
     return mcp

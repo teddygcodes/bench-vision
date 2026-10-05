@@ -87,3 +87,26 @@ triggering another review round; none affects results, data, or error handling.
 - The legend font follows the image's long edge, so on a very narrow tall image (e.g. 200x1920) every entry is shortened to "N lo…".
 - Whitespace-only mark text passes validation and draws an empty label box.
 - Tabs, other control characters and glyphs the font lacks (emoji, CJK) draw as missing-glyph boxes.
+
+## Deliverable 7
+- When a second display on the same root holds the camera lock, the live-view status says "paused for a capture".
+- The LIVE badge (top-left) can cover a reticle placed in the top-left corner.
+- A missing verdict thumbnail shows as a broken image with alt text.
+- set_target uses the configured resolution if this server hasn't captured from that camera yet; a camera delivering a different aspect ratio would misplace the reticle.
+- A capture that waits more than 1.5 s for the camera lock fails rather than queueing, even when the holder is another capture (two servers, or the `capture` CLI during a server capture).
+- The live reader opens the camera at its full configured resolution and decodes every frame before scaling to 960 px; a lower stream resolution would save CPU and USB bandwidth (needs per-camera mode knowledge to keep the same field of view).
+- Mock-mode boards and display state share the live project's `boards/` and `.bench-vision/display.json`, so the README's mock walkthrough leaves "mock-board" as the current board.
+- record_verdict crops the joint whenever the image has the board reference's size, even if it came from another camera.
+- Joint ids up to 24 characters wrap to several lines in the verdict strip and shrink the live view at 1280x720.
+- While the display server is down, the page keeps the LIVE badge on the frozen frame (the offline banner explains it).
+- With a missing live camera, the status alternates between "starting" and "unavailable" every 3 s, so the page text flickers.
+- A reader that prints garbage instead of frames leaves the status at "starting".
+- A reader stuck in the kernel past the 0.9 s kill wait has the lock released anyway; the capture may then fail with "device busy" (never blocked), and only the display's log says why.
+- A hand-edited board whose joint lacks x/y/w/h makes board_set(active) report "internal error (KeyError)" rather than "corrupt board".
+- Targets are not tied to a board: a reticle stays up after board_init switches to another board.
+- Raw OpenCV error text can reach the wall's live-view status when a read fails with cv2.error; an open failure that isn't a bench-vision error shows only the exception type.
+- Two MCP servers on one root overwrite each other's set_control values in controls.json; the live reader uses the last writer's.
+- After a reader dies from a signal, the status may show its last stderr line (a warning) rather than "camera reader exited (-9)".
+- The live-view open error lacks the capture error's "another program / video group?" hint.
+- A missing live camera is retried every 3 s (a fresh Python + cv2 import each time) while a page watches; ~4% CPU on a Mac, more on a small box. Could back off.
+- Run by hand with stdin closed, the reader exits 0 silently; with stdin = /dev/zero its watcher spins. Under the display stdin is always a pipe.

@@ -16,7 +16,7 @@ CONTROL_RE = re.compile(r"^\s*([a-z][a-z0-9_]*)\s*=\s*(-?\d+)\s*$")
 
 TOP_LEVEL_KEYS = {"cameras", "server", "display"}
 SERVER_KEYS = {"jpeg_quality"}
-DISPLAY_KEYS = {"url"}
+DISPLAY_KEYS = {"url", "live_camera", "live_idle_seconds"}
 DEFAULT_DISPLAY_URL = "http://127.0.0.1:8765"
 CAMERA_KEYS = {"device", "resolution", "fourcc", "default_rotation", "warmup_frames", "v4l2_controls"}
 
@@ -38,6 +38,8 @@ class Config:
     cameras: dict[str, CameraConfig]
     jpeg_quality: int = 85
     display_url: str = DEFAULT_DISPLAY_URL
+    live_camera: str = "scope"
+    live_idle_seconds: float = 20.0
     path: Path | None = None
 
 
@@ -161,7 +163,18 @@ def parse_config(data: dict, where: str = "config.toml", path: Path | None = Non
             f"server doesn't speak https), got {url!r}."
         )
 
-    return Config(cameras=cameras, jpeg_quality=quality, path=path, display_url=url.rstrip("/"))
+    live_cam = display.get("live_camera", "scope" if "scope" in cameras else next(iter(cameras)))
+    if not isinstance(live_cam, str) or live_cam not in cameras:
+        raise ConfigError(
+            f"{where} [display]: 'live_camera' must be one of the configured cameras "
+            f"({', '.join(cameras)}), got {live_cam!r}."
+        )
+    idle = display.get("live_idle_seconds", 20)
+    if isinstance(idle, bool) or not isinstance(idle, (int, float)) or not 1 <= idle <= 3600:
+        raise ConfigError(f"{where} [display]: 'live_idle_seconds' must be a number 1-3600, got {idle!r}.")
+
+    return Config(cameras=cameras, jpeg_quality=quality, path=path, display_url=url.rstrip("/"),
+                  live_camera=live_cam, live_idle_seconds=float(idle))
 
 
 def load_config(path: Path, mock: bool = False) -> Config:

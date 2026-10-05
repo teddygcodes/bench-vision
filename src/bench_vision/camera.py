@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import queue
@@ -119,6 +120,19 @@ class OpenCVBackend:
                 "Try unplugging and replugging it; details are in the server's stderr log."
             ) from None
 
+    def open_stream(self, cam: CameraConfig, controls: list[tuple[str, int]] = ()) -> OpenCVStream:
+        if not self.device_present(cam):
+            raise missing_device_error(cam)
+        if self._worker is not None and self._worker[1].is_alive():
+            raise CameraError(f"Camera '{self._worker[0]}' is stuck in an earlier capture.")
+        stream = OpenCVStream(cam)
+        try:
+            self._apply_controls(cam, list(controls))  # same controls a capture applies on open
+        except BaseException:
+            stream.close()
+            raise
+        return stream
+
     def _grab(self, cam: CameraConfig, controls: list[tuple[str, int]]) -> Frame:
         if self._worker is not None and self._worker[1].is_alive():
             raise CameraError(
@@ -204,6 +218,54 @@ class OpenCVBackend:
         if (w, h) != cam.resolution:
             log.warning("camera %s: requested %sx%s, got %sx%s", cam.name, *cam.resolution, w, h)
         return Frame(cam.name, frame, applied or {})
+
+
+class OpenCVStream:
+    """A held-open low-resolution reader for the live view (one per open; close() releases the device)."""
+
+    def __init__(self, cam: CameraConfig):
+        self.cam = cam
+        real = str(Path(cam.device).resolve())
+        self.cap = cv2.VideoCapture(real, cv2.CAP_V4L2)
+        if not self.cap.isOpened():
+            self.cap.release()
+            raise CameraError(f"Camera '{cam.name}' ({cam.device}) could not be opened for the live view.")
+        self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*cam.fourcc))
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, cam.resolution[0])
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, cam.resolution[1])
+        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # we read slower than the camera: keep frames fresh
+
+    def read(self) -> np.ndarray | None:
+        ok, img = self.cap.read()
+        return img if ok and img is not None and img.size > 0 else None
+
+    def close(self) -> None:
+        self.cap.release()
+
+
+class MockStream:
+    """Live view in --mock mode: the mock image with a running clock, so motion is visible."""
+
+    def __init__(self, image: np.ndarray, fps: float = 15.0):
+        self.image = image
+        self.period = 1.0 / fps
+
+    def read(self) -> np.ndarray | None:
+        import time as _time
+
+        _time.sleep(self.period)
+        frame = self.image.copy()
+        h, w = frame.shape[:2]
+        text = f"LIVE (mock) {_time.strftime('%H:%M:%S')}.{int(_time.time() * 10) % 10}"
+        scale = max(w, h) / 1400
+        cv2.putText(frame, text, (int(w * 0.02), int(h - h * 0.04)), cv2.FONT_HERSHEY_SIMPLEX, scale,
+                    (0, 0, 0), max(2, int(scale * 6)), cv2.LINE_AA)
+        cv2.putText(frame, text, (int(w * 0.02), int(h - h * 0.04)), cv2.FONT_HERSHEY_SIMPLEX, scale,
+                    (255, 255, 255), max(1, int(scale * 2)), cv2.LINE_AA)
+        return frame
+
+    def close(self) -> None:
+        pass
 
 
 # Controls a mock camera pretends to have, so set_control is testable offline.
@@ -320,6 +382,14 @@ class MockBackend:
         self._values.setdefault(cam.name, {})[name] = value
         return value
 
+    def open_stream(self, cam: CameraConfig, controls: list[tuple[str, int]] = ()) -> MockStream:
+        img = load_image_strict(self._require(cam)[0])
+        if img is None:
+            raise CameraError(f"Mock image for '{cam.name}' could not be decoded.")
+        for name, value in controls:
+            self.set_ctrl(cam, name, value)
+        return MockStream(img)
+
     def grab(self, cam: CameraConfig, controls: list[tuple[str, int]]) -> Frame:
         imgs = self._require(cam)
         i = self._counters.get(cam.name, 0)
@@ -339,9 +409,10 @@ class MockBackend:
 class CameraManager:
     """Opens cameras lazily and never more than one at a time."""
 
-    def __init__(self, cameras: dict[str, CameraConfig], backend: Backend):
+    def __init__(self, cameras: dict[str, CameraConfig], backend: Backend, camera_lock: Any = None):
         self.cameras = cameras
         self.backend = backend
+        self.camera_lock = camera_lock  # cross-process lock shared with the live view (camlock.CameraLock)
         self._lock = threading.Lock()
         self.open_camera: str | None = None
         self.last_size: dict[str, tuple[int, int]] = {}
@@ -371,8 +442,10 @@ class CameraManager:
                 f"Camera '{name}' is waiting on another capture that has not finished after {LOCK_TIMEOUT:g} s."
             )
         try:
-            self.open_camera = name
-            frame = self.backend.grab(cam, self.controls_for(cam))
+            # The live view (another process) yields within ~0.5 s; it never blocks this for long.
+            with self.camera_lock.for_capture(name) if self.camera_lock else contextlib.nullcontext():
+                self.open_camera = name
+                frame = self.backend.grab(cam, self.controls_for(cam))
         finally:
             self.open_camera = None
             self._lock.release()  # always, even if the grab failed or timed out

@@ -77,10 +77,32 @@ def _port(text: str) -> int:
 
 
 def _display(args: argparse.Namespace) -> int:
+    os.environ["OPENCV_LOG_LEVEL"] = "WARNING"
+    from . import imaging
+    from .app import BenchVision
     from .display import make_server
+    from .live import LiveStream
 
+    root = Path(args.root).resolve()
+    bv = BenchVision(root, mock=args.mock, config_path=Path(args.config).resolve() if args.config else None)
+    lock = bv.cameras.camera_lock
+    if bv.config_error is not None:
+        live, cam_name, size, idle = LiveStream(None, lock, f"unavailable: {bv.config_error}"), None, None, 20.0
+    else:
+        cfg = bv.config
+        cam = cfg.cameras[cfg.live_camera]
+        w, h = bv.cameras.last_size.get(cam.name, cam.resolution)
+        size = (h, w) if imaging.normalize_rotation(cam.default_rotation) in (90, 270) else (w, h)
+        # the camera is read in a child process, so freeing it for a capture can't be blocked by a stuck read
+        command = [sys.executable, "-m", "bench_vision.livereader", "--root", str(root), "--cam", cam.name]
+        if args.mock:
+            command.append("--mock")
+        if args.config:
+            command += ["--config", str(Path(args.config).resolve())]
+        live, cam_name, idle = LiveStream(command, lock), cam.name, cfg.live_idle_seconds
     try:
-        server, _ = make_server(args.host, args.port)
+        server, _ = make_server(args.host, args.port, root=root, live=live, live_cam=cam_name, live_size=size,
+                                live_idle=idle)
     except OSError as e:
         import errno
 
@@ -179,6 +201,9 @@ def main(argv: list[str] | None = None) -> int:
     disp = sub.add_parser("display", help="serve the wall-display page (open it in Chromium --kiosk)")
     disp.add_argument("--host", default="127.0.0.1", help="address to listen on (default 127.0.0.1)")
     disp.add_argument("--port", type=_port, default=8765, help="port (default 8765)")
+    disp.add_argument("--mock", action="store_true", help="live view from the images in ./mock/")
+    disp.add_argument("--root", default=".", help="project directory (config.toml, boards/, mock/)")
+    disp.add_argument("--config", help="config file (default: <root>/config.toml)")
     disp.set_defaults(func=_display)
 
     callp = sub.add_parser("call", help="run any MCP tool once without Claude, e.g. show_step")

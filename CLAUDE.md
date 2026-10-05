@@ -34,6 +34,9 @@ foreshortens: never call a bridge from side alone.
   caption: what's wrong, what to do ("J5 cold joint: reflow with fresh flux").
 - When you give the user a step: call `show_step(title, body, ...)` first (3-5 short lines, `progress`
   like "joint 4 of 18"), then tell them in chat.
+- After every inspection verdict: `record_verdict(joint_id, verdict, image_path, note)` (needs a board from
+  `board_init`; mark states with `board_set`). After `board_set(..., "active")`: call `set_target` (its reply
+  gives the exact call) so the joint is boxed on the live view.
 - If a `show*` tool says the display isn't running, say so once and carry on in chat.
 
 ## How to answer

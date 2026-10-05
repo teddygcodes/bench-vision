@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
+import threading
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Union
@@ -19,6 +21,8 @@ from .storage import CaptureStore
 from .v4l2 import validate_control
 
 log = logging.getLogger(__name__)
+
+CONTROLS_FILE = "controls.json"  # set_control values shared with the live reader
 
 # A tool result: JPEG bytes become image blocks, strings become text blocks.
 Result = list[Union[bytes, str]]
@@ -48,7 +52,7 @@ def _mock_config(mock: MockBackend) -> Config:
             log.warning("mock image for '%s' does not decode; its resolution is unknown", name)
         size = (img.shape[1], img.shape[0]) if img is not None else (0, 0)  # (0, 0) = unknown
         cams[name] = CameraConfig(name=name, device=f"mock:{name}", resolution=size)
-    return Config(cameras=cams)
+    return Config(cameras=cams, live_camera="scope" if "scope" in cams else next(iter(cams)))
 
 
 def _check_text(value: Any, name: str, limit: int, required: bool) -> str | None:
@@ -130,7 +134,9 @@ class BenchVision:
                 "This is a bug; details are in the server's stderr log."
             )
         cams = self.config.cameras if self.config else {}
-        self.cameras = CameraManager(cams, backend)
+        from .camlock import CameraLock
+
+        self.cameras = CameraManager(cams, backend, CameraLock(root / ".bench-vision"))
         # Kept out of captures/ (only images + sidecars there); mock and live never share grids.
         self.references = ReferenceStore(root / ("references-mock" if mock else "references"))
         self.grids = GridStore(root / ".bench-vision" / ("grids-mock.json" if mock else "grids.json"))
@@ -274,7 +280,9 @@ class BenchVision:
         cfg, frame, rotation, img = self._frame(cam, rotate)
         full_h, full_w = img.shape[:2]
         box = imaging.clamp_box(x, y, w, h, full_w, full_h)
-        return self._region(cam, cfg, frame, rotation, img, box, (x, y, w, h), max_edge, "capture_region")
+        result = self._region(cam, cfg, frame, rotation, img, box, (x, y, w, h), max_edge, "capture_region")
+        result[1] += self._target_hint(cam, cfg, rotation, box, "here")
+        return result
 
     # ----------------------------------------------------------------- grids
 
@@ -359,6 +367,7 @@ class BenchVision:
         )
         drawn = f" drawn {grid['drawn_at']}" if grid.get("drawn_at") else ""
         result[1] = f"Cell {imaging.cell_name(row, col)} of the {rows}x{cols} grid{drawn}. " + result[1]
+        result[1] += self._target_hint(cam, cfg, rotation, (cx, cy, cw, ch), name)
         if grid.get("full_res_size") and list(grid["full_res_size"]) != [full_w, full_h]:
             result[1] += (
                 f" Note: the frame is now {full_w}x{full_h} but the grid was drawn on "
@@ -520,6 +529,7 @@ class BenchVision:
                      "exposure_auto": ("exposure_absolute", lambda v: v not in (1, 2))}.get(control)
         if dependent and dependent[1](value) and overrides.pop(dependent[0], None) is not None:
             dropped = f" (stopped re-applying {dependent[0]}, which is inactive in this mode)"
+        self._save_overrides()
         rng = f"{info.min}..{info.max}" if info.min is not None and info.max is not None else "?"
         readback = f", camera now reports {after}" if after is not None and after != value else ""
         return (
@@ -527,6 +537,41 @@ class BenchVision:
             f"'{cam}' opens until the server restarts; to keep it, add \"{control}={value}\" to the "
             f"[cameras.{cam}] v4l2_controls list in config.toml."
         )
+
+    def _save_overrides(self) -> None:
+        """Share set_control values with the live view's reader (another process), so opening the camera
+        for the live view doesn't reset them to the config values. Tagged with this pid: they last only
+        as long as this server."""
+        path = self._controls_file()
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+            tmp.write_text(json.dumps({"pid": os.getpid(), "overrides": self.cameras.overrides}), encoding="utf-8")
+            os.replace(tmp, path)
+        except OSError as e:
+            log.warning("could not save set_control values for the live view: %s", e)
+
+    def _controls_file(self) -> Path:
+        # a --mock server's invented controls must never reach the real cameras' live view
+        return self.root / ".bench-vision" / (f"{CONTROLS_FILE[:-5]}-mock.json" if self.mock else CONTROLS_FILE)
+
+    def load_shared_overrides(self) -> None:
+        """In the live reader: pick up set_control values from a running MCP server (see _save_overrides)."""
+        from .camlock import _pid_alive
+
+        try:
+            data = json.loads(self._controls_file().read_text(encoding="utf-8"))
+            pid, overrides = int(data["pid"]), data["overrides"]
+        except (OSError, ValueError, KeyError, TypeError, RecursionError):
+            return
+        if not 0 < pid < 2**31 or not _pid_alive(pid) or not isinstance(overrides, dict):
+            return
+        for cam, values in overrides.items():
+            if isinstance(values, dict):
+                self.cameras.overrides[cam] = {
+                    k: v for k, v in values.items()
+                    if isinstance(k, str) and isinstance(v, int) and not isinstance(v, bool)
+                }
 
     # ------------------------------------------------------------- wall display
 
@@ -655,3 +700,173 @@ class BenchVision:
             raise BenchVisionError(f"area must be 'all', 'image' or 'step'; got {_short(area, 20)}.")
         self._push({"area": "clear", "which": area})
         return f"Cleared the wall display ({area})."
+
+    # ------------------------------------------------------- live view target
+
+    def _live_frame_size(self, cfg: CameraConfig) -> tuple[int, int]:
+        """Full-res size of a camera's frame at its default rotation (what the live view shows)."""
+        w, h = self.cameras.last_size.get(cfg.name, cfg.resolution)
+        return (h, w) if cfg.default_rotation in (90, 270) else (w, h)
+
+    def _target_hint(self, cam: str, cfg: CameraConfig, rotation: int, box: tuple[int, int, int, int],
+                     label: str) -> str:
+        if rotation != cfg.default_rotation:
+            return ""  # the live view shows the default rotation; these coordinates wouldn't match
+        x, y, w, h = box
+        return (f"\nTo mark it on the wall's live view: set_target(cam=\"{cam}\", x={x}, y={y}, w={w}, h={h}, "
+                f"label=\"{label}\").")
+
+    def set_target(self, cam: str, x: int, y: int, w: int, h: int, label: str = "") -> str:
+        cfg_all = self._ready()
+        cfg = self.cameras.get(cam)
+        label = _check_text(label, "label", 60, required=False) or ""
+        if "\n" in label or "\r" in label:
+            raise BenchVisionError("label must be one line (e.g. \"J5\").")
+        fw, fh = self._live_frame_size(cfg)
+        box = imaging.clamp_box(x, y, w, h, fw, fh)
+        self._push({"area": "target", "cam": cam, "x": box[0], "y": box[1], "w": box[2], "h": box[3],
+                    "label": label, "frame_w": fw, "frame_h": fh})
+        clipped = "" if box == (x, y, w, h) else f" (clipped to the {fw}x{fh} frame)"
+        where = "" if cam == cfg_all.live_camera else (
+            f" The wall's live view shows '{cfg_all.live_camera}', so this reticle appears only if that is "
+            f"changed to '{cam}' ([display] live_camera)."
+        )
+        return f"Reticle set on '{cam}' at x={box[0]}, y={box[1]}, w={box[2]}, h={box[3]}{clipped}.{where}"
+
+    def clear_target(self, cam: str) -> str:
+        self._ready()
+        self.cameras.get(cam)
+        self._push({"area": "target", "cam": cam, "clear": True})
+        return f"Reticle cleared on '{cam}'."
+
+    # ------------------------------------------------------------- boards
+
+    def _boards(self) -> Any:
+        from .boards import BoardStore
+
+        return BoardStore(self.root / "boards")
+
+    def _push_board(self) -> str:
+        """Tell the display the board changed; a display that isn't running is reported, not fatal."""
+        try:
+            self._push({"area": "board"})
+            return ""
+        except BenchVisionError as e:
+            return f" (Saved; the wall display wasn't updated: {e})"
+
+    def board_init(self, name: str, image_path: str, joints: Any) -> str:
+        from . import boards
+
+        self._ready()
+        name = boards.check_name(name)
+        src = self._image_file(image_path)
+        bgr = load_image_strict(src)
+        if bgr is None:
+            raise BenchVisionError(f"image_path {_short(image_path, 80)} is not a readable JPEG/PNG image.")
+        H, W = bgr.shape[:2]
+        if not isinstance(joints, list) or not joints:
+            raise BenchVisionError("joints must be a non-empty list of {id, x, y, w, h} in the image's pixels.")
+        if len(joints) > boards.MAX_JOINTS:
+            raise BenchVisionError(f"At most {boards.MAX_JOINTS} joints per board; got {len(joints)}.")
+        clean, seen = [], set()
+        for i, j in enumerate(joints):
+            where = f"joints[{i}]"
+            if not isinstance(j, dict) or set(j) != {"id", "x", "y", "w", "h"}:
+                raise BenchVisionError(f"{where} must be an object with exactly id, x, y, w, h.")
+            jid = j.get("id")
+            if not isinstance(jid, str) or not boards.JOINT_RE.fullmatch(jid):
+                raise BenchVisionError(f"{where}: id must be 1-24 letters/digits (e.g. \"J5\"); got {repr(jid)[:30]}.")
+            if jid in seen:
+                raise BenchVisionError(f"{where}: duplicate joint id {jid!r}.")
+            seen.add(jid)
+            nums = {}
+            for k in ("x", "y", "w", "h"):
+                v = j.get(k)
+                if isinstance(v, bool) or not isinstance(v, (int, float)) or v != v or abs(v) > 1e6:
+                    raise BenchVisionError(f"{where} ({jid}): {k} must be a number of pixels.")
+                nums[k] = round(float(v), 1)
+            if nums["w"] <= 0 or nums["h"] <= 0 or nums["x"] < 0 or nums["y"] < 0 or \
+                    nums["x"] + nums["w"] > W or nums["y"] + nums["h"] > H:
+                raise BenchVisionError(
+                    f"{where} ({jid}) is not inside the {W}x{H} image (x, y = top-left; w, h > 0)."
+                )
+            clean.append({"id": jid, **nums})
+        camera = self._source_camera(src)
+        jpeg = imaging.encode_jpeg(imaging.to_pil(bgr), ARCHIVE_JPEG_QUALITY)
+        self._boards().init(name, jpeg, (W, H), clean, self._relpath(src), camera)
+        note = self._push_board()
+        cam_note = f" Reference came from '{camera}'." if camera else ""
+        return (f"Board '{name}' recorded: {len(clean)} joints on a {W}x{H} reference "
+                f"(boards/{name}.json), all todo; it is now the current board.{cam_note}{note}")
+
+    def _source_camera(self, src: Path) -> str | None:
+        """The camera a capture came from, if its sidecar says so and it used the default rotation."""
+        try:
+            meta = json.loads(src.with_suffix(".json").read_text(encoding="utf-8"))
+            cam, rotation = meta.get("camera"), meta.get("rotation")
+            cfg = self.cameras.cameras.get(cam) if isinstance(cam, str) else None
+            if cfg is not None and rotation == cfg.default_rotation and meta.get("crop_box") in (None, []):
+                return cam
+        except (OSError, ValueError, AttributeError, RecursionError):
+            pass
+        return None
+
+    def board_set(self, name: str, joint_id: str, state: str) -> str:
+        from . import boards
+
+        self._ready()
+        name = boards.check_name(name)
+        if state not in boards.STATES:
+            raise BenchVisionError(f"state must be one of {', '.join(boards.STATES)}; got {_short(state, 20)}.")
+        if not isinstance(joint_id, str) or not joint_id:
+            raise BenchVisionError("joint_id must be a joint id from board_init, e.g. \"J5\".")
+        board, demoted = self._boards().set_state(name, joint_id, state)
+        note = self._push_board()
+        extra = f" {demoted} went back to todo (one active joint at a time)." if demoted else ""
+        hint = ""
+        if state == "active":
+            j = next(j for j in board["joints"] if j.get("id") == joint_id)
+            box = tuple(round(j[k]) for k in ("x", "y", "w", "h"))
+            cam = board.get("camera")
+            if isinstance(cam, str) and cam in self.cameras.cameras:
+                hint = (f" Now mark it: set_target(cam=\"{cam}\", x={box[0]}, y={box[1]}, w={box[2]}, h={box[3]}, "
+                        f"label=\"{joint_id}\").")
+            else:
+                hint = (f" Its box in the reference image is x={box[0]}, y={box[1]}, w={box[2]}, h={box[3]}; use "
+                        "set_target with those if the reference came from that camera's full frame.")
+        counts = {s: sum(1 for j in board["joints"] if j.get("state") == s) for s in boards.STATES}
+        return (f"Board '{name}': {joint_id} is {state}.{extra} "
+                f"({counts['verified']} verified, {counts['flagged']} flagged, {counts['todo']} todo.){hint}{note}")
+
+    def record_verdict(self, joint_id: str, verdict: str, image_path: str, note: str = "") -> str:
+        from . import boards
+
+        self._ready()
+        store = self._boards()
+        name = store.current_name()
+        if name is None:
+            raise BenchVisionError("No current board: call board_init first.")
+        board = store.load(name)
+        joint = next((j for j in board["joints"] if isinstance(j, dict) and j.get("id") == joint_id), None)
+        if not isinstance(joint_id, str) or joint is None:
+            raise BenchVisionError(f"Board '{name}' has no joint {_short(joint_id, 30)}.")
+        v = verdict.strip().lower() if isinstance(verdict, str) else None
+        if v not in boards.VERDICTS:
+            raise BenchVisionError(f"verdict must be one of {', '.join(boards.VERDICTS)}; got {_short(verdict, 30)}.")
+        note = _one_line(_check_text(note, "note", 200, required=False), "note") or ""
+        src = self._image_file(image_path)
+        bgr = load_image_strict(src)
+        if bgr is None:
+            raise BenchVisionError(f"image_path {_short(image_path, 80)} is not a readable JPEG/PNG image.")
+        img = imaging.to_pil(bgr)
+        if list(img.size) == list(board.get("size", [])):
+            # same frame as the board reference: crop the joint, with context around it
+            x, y, w, h = (float(joint[k]) for k in ("x", "y", "w", "h"))
+            m = max(w, h) * 0.6 + 16
+            img = img.crop((max(0, x - m), max(0, y - m), min(img.size[0], x + w + m), min(img.size[1], y + h + m)))
+        thumb = imaging.encode_jpeg(imaging.fit_long_edge(img, 240), 85)
+        entry = store.add_verdict(name, {"joint": joint_id, "verdict": v, "note": note,
+                                         "image_path": self._relpath(src),
+                                         "time": self.clock().isoformat(timespec="seconds")}, thumb)
+        shown = self._push_board()
+        return f"Recorded on '{name}': {joint_id} = {v}{f' ({note})' if note else ''} [{entry['thumb']}].{shown}"

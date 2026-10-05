@@ -11,7 +11,8 @@ and adjusts focus/exposure. Images go to Claude; nothing runs a local vision mod
 
 - `git`
 - [`uv`](https://docs.astral.sh/uv/getting-started/installation/) (it installs Python 3.11 for you)
-- Claude Code with its `claude` command on your PATH (check: `claude --version`)
+- Claude Code with its `claude` command on your PATH (check: `claude --version`); needed to register
+  the MCP server, not for mock captures or the wall display
 - For real cameras: Linux with V4L2 and `v4l2-ctl` (package `v4l-utils`). Mock mode works anywhere.
 
 ## Quick start in mock mode (no cameras, any OS)
@@ -64,17 +65,18 @@ and a solder ball between J7 and J8.
 
 ## Wall display
 
-Trying the display needs only `uv sync` (no cameras, no Claude Code). `bench-vision display` serves a page at <http://127.0.0.1:8765> for a monitor on the wall: the
-left two thirds show the image Claude is talking about (or two side by side) with a caption bar,
-the right third shows the current step. Claude drives it with `show`, `show_compare`,
-`show_step` and `show_clear`; updates appear within a second, no reload. If the display isn't
+Trying the display needs only `uv sync` (no cameras, no Claude Code). `bench-vision display`
+serves a page at <http://127.0.0.1:8765> for a monitor on the wall: the left two thirds show the
+image Claude is talking about (or two side by side) with a caption bar, and otherwise a live view
+of the `scope` camera; the right third shows the board map and the current step. Claude drives it
+with `show`, `show_compare`, `show_step` and `show_clear`; updates appear within a second, no reload. If the display isn't
 running, those tools say so in one line and everything else keeps working.
 
 Try it in mock mode. In one terminal, inside `bench-vision`, start the display server and leave it
-running:
+running (`--mock` makes its live view play the mock board; on the Linux box leave it out):
 
 ```bash
-uv run bench-vision display
+uv run bench-vision display --mock
 ```
 
 Open <http://127.0.0.1:8765> in a browser. In a second terminal, inside `bench-vision`, push a
@@ -94,7 +96,59 @@ uv run bench-vision call capture '{"cam": "scope"}' --mock
 uv run bench-vision call show '{"image_path": "PASTE_IMAGE_PATH_HERE", "caption": "J5 cold joint: reflow with fresh flux", "marks": [{"kind": "circle", "x": 1000, "y": 480, "w": 120, "h": 120, "text": "J5"}]}' --mock
 ```
 
-(On the Linux box with real cameras, drop `--mock`.) Stop the display server with Ctrl-C.
+(On the Linux box with real cameras, drop `--mock`.) Keep the display running for the next section.
+
+### Live view, board map and verdicts
+
+When nothing has been pushed with `show` for 20 seconds (`[display] live_idle_seconds`), or after
+`show_clear` with `{"area": "image"}`, the image area shows a live view of the `scope` camera
+(`[display] live_camera`) at up to 15 fps. It only runs while the page is open, stays on this
+machine (nothing from it goes to Claude), and hands the camera to Claude's capture tools whenever
+they need it, within half a second. `set_target` draws a box on it. Run the display and the MCP
+server from the same `bench-vision` folder: they share the camera hand-over and the board files.
+
+A board is a reference image plus the joints on it. With the display from above still running
+(`--mock`), try it on the mock board. Take a capture and note its `image_path`:
+
+```bash
+uv run bench-vision call capture '{"cam": "scope"}' --mock
+```
+
+Record the board, pasting that path in place of `PASTE_IMAGE_PATH_HERE` (the joint boxes are the
+mock board's J1-J8 in full-resolution pixels):
+
+```bash
+uv run bench-vision call board_init '{"name": "mock-board", "image_path": "PASTE_IMAGE_PATH_HERE", "joints": [{"id": "J1", "x": 165, "y": 475, "w": 130, "h": 130}, {"id": "J2", "x": 373, "y": 475, "w": 130, "h": 130}, {"id": "J3", "x": 580, "y": 475, "w": 130, "h": 130}, {"id": "J4", "x": 787, "y": 475, "w": 130, "h": 130}, {"id": "J5", "x": 995, "y": 475, "w": 130, "h": 130}, {"id": "J6", "x": 1202, "y": 475, "w": 130, "h": 130}, {"id": "J7", "x": 1410, "y": 475, "w": 130, "h": 130}, {"id": "J8", "x": 1617, "y": 475, "w": 130, "h": 130}]}' --mock
+```
+
+The board-map tile appears at the top of the step panel with every joint grey (todo). Mark two
+joints verified, one flagged, and make J5 the active one:
+
+```bash
+uv run bench-vision call board_set '{"name": "mock-board", "joint_id": "J1", "state": "verified"}' --mock
+uv run bench-vision call board_set '{"name": "mock-board", "joint_id": "J2", "state": "verified"}' --mock
+uv run bench-vision call board_set '{"name": "mock-board", "joint_id": "J3", "state": "flagged"}' --mock
+uv run bench-vision call board_set '{"name": "mock-board", "joint_id": "J5", "state": "active"}' --mock
+```
+
+The map now shows J1 and J2 green, J3 red, and J5 yellow and pulsing. The last command prints the
+`set_target` call for J5 (in the form Claude uses); as a command it is:
+
+```bash
+uv run bench-vision call set_target '{"cam": "scope", "x": 995, "y": 475, "w": 130, "h": 130, "label": "J5"}' --mock
+```
+
+A yellow box labelled J5 appears around J5 on the live view (once the live view is showing again,
+i.e. up to 20 s after the last `show`). Verdicts go in the strip along the bottom of the image area
+as a thumbnail with the joint id under it (green border = good, red = anything else). Use the same
+capture path as for `board_init`:
+
+```bash
+uv run bench-vision call record_verdict '{"joint_id": "J3", "verdict": "bridge", "image_path": "PASTE_IMAGE_PATH_HERE", "note": "bridged to J4"}' --mock
+```
+
+Boards are saved in `boards/`. When the display restarts it reloads the current board, its last
+verdicts, the current step and the targets. Stop the display server with Ctrl-C when you're done.
 
 ### Start on login (Ubuntu)
 
@@ -186,6 +240,8 @@ jpeg_quality = 85                 # JPEGs returned to Claude
 
 [display]
 url = "http://127.0.0.1:8765"     # where the show tools push to; match `bench-vision display --port` (default)
+live_camera = "scope"             # camera for the wall's live view (default: scope)
+live_idle_seconds = 20            # seconds a pushed image stays before the live view returns
 
 [cameras.side]
 device = "/dev/v4l/by-id/usb-Arducam_..._video-index0"   # never bare /dev/videoN
@@ -216,9 +272,13 @@ every tool as one clear line naming the entry.
 | `show_compare(left_path, right_path, caption, left_label, right_label)` | Two images side by side on the wall display |
 | `show_step(title, body, image_path=None, marks=[], progress=None)` | Fill the display's step panel (stays until replaced) |
 | `show_clear(area="all")` | Clear `all`, `image` or `step` |
+| `set_target(cam, x, y, w, h, label)` / `clear_target(cam)` | Box (or unbox) a spot on the wall's live view, in that camera's full-res pixels |
+| `board_init(name, image_path, joints)` | Record a board: reference image + `[{id, x, y, w, h}]` joints; becomes the current board |
+| `board_set(name, joint_id, state)` | `todo`, `active`, `verified` or `flagged` (one active joint at a time) |
+| `record_verdict(joint_id, verdict, image_path, note="")` | Log a verdict for a joint of the current board; shown on the verdict strip |
 
 Coordinates are full-resolution pixels of the (rotated) frame; every reply states the frame
-size and the scale of the returned image, and ends with `image_path:` (the saved full-res frame,
+size and the scale of the returned image, and includes `image_path:` (the saved full-res frame,
 which `show` takes directly); `save_reference` and `compare` also give `reference_path:`. Only one camera is ever open at a time, opened
 lazily per call; opening times out after 5 s and each frame after 5 s.
 
@@ -228,6 +288,8 @@ lazily per call; opening times out after 5 s and each frame after 5 s.
   tool call, with a sidecar (camera, controls, crop box, sizes). This history survives `/clear`.
 - `references/<cam>/<name>.png` + `.json`: saved references (`references-mock/` in mock mode).
 - `.bench-vision/`: the last grid per camera, so `capture_cell` survives a server restart.
+- `boards/<name>.json`, `boards/<name>.jpg`, `boards/<name>/`: boards, their reference images, verdict
+  log and thumbnails; `boards/.current.json` names the board the display shows.
 - `<image>.marked.jpg`: the annotated copy `show`/`show_step` draw marks on, next to the capture
   (images from elsewhere, e.g. `mock/`, get theirs in today's `captures/` folder).
 
