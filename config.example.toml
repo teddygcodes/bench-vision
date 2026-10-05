@@ -2,7 +2,7 @@
 # Device paths must be stable /dev/v4l/by-id/ links, never bare /dev/videoN.
 
 [server]
-jpeg_quality = 85            # quality of JPEGs returned to Claude and saved to captures/
+jpeg_quality = 85            # quality of JPEGs returned to Claude (captures/ keeps full res at 92)
 
 [cameras.scope]              # TOMLOV TM3K-AF Max in "PC Camera" mode, straight down
 device = "/dev/v4l/by-id/usb-REPLACE_ME_TOMLOV-video-index0"

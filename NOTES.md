@@ -38,8 +38,27 @@ triggering another review round; none affects results, data, or error handling.
 - An override that fails validation at open (e.g. the device changed) is reported as a "config.toml [cameras.x] v4l2_controls" error.
 - `value=True` / `value="5"` are coerced to integers by the MCP layer (same class as the deliverable 2 note).
 - The set_control docstring says an unknown name lists available controls "with their ranges"; the list has names only (ranges appear in the out-of-range error).
-- Older kernels name controls `focus_auto` / `exposure_auto` / `exposure_absolute`; with those, setup doesn't generate the autofocus lock and the inactive hints / override dropping don't apply (opening still works: inactive controls are skipped). Check `setup` output on the mini PC.
+- Older kernels name controls `focus_auto` / `exposure_auto` / `exposure_absolute`. Handled since deliverable 5 (setup's focus lock, set_control hints and override dropping, apply order); see the README's Linux section.
 - `subprocess.run` waits for a killed v4l2-ctl after its timeout; one stuck in an uninterruptible ioctl on a dead USB device could block set_control or setup (captures are protected by their worker timeout).
 - If a device reports no `focus_absolute` value, the starter config writes `focus_absolute=0`, which a camera with min > 0 would reject at open.
 - Opening a real non-by-id device on a Mac reports "could not be opened ... video group" rather than "needs Linux" (by-id configs can't reach this).
 - The 90 s capture lock wait is shorter than the worst-case capture with 6+ config controls (each v4l2-ctl call may take up to 5 s), so a queued capture could give up early.
+
+## Deliverable 5
+- The README tool table omits `rotate`/`max_edge` on `save_reference` and `max_edge` on `compare` (the tools' own descriptions list them).
+- The README's "use it from another project directory" tip doesn't mention that this repo's `CLAUDE.md` inspection guidance won't load in that other project.
+- README "First inspection": "Start Claude Code in the same directory and ask:" sits before the `claude` command rather than the prompt; reads slightly out of order.
+- The `capture` CLI takes no cross-process camera lock, so running it while a live server is mid-capture could open two cameras at once (two Claude sessions on one repo have the same gap).
+- `--out ""` is silently ignored.
+- With stdout piped, the `--out` error on stderr can appear before the capture text it says is "above".
+- No unit test covers set_control's old-kernel hints and override dropping (verified by hand in review).
+- A Ctrl-C in the first few milliseconds, before `bench-vision` has even imported its CLI module, still gets Python's default traceback.
+- README: `uv run pytest -q` doesn't say what success looks like ("N passed", about a minute).
+- README: `claude mcp list` also prints a health-check line and every other configured server; only the bench-vision line matters.
+- README "First inspection" doesn't mention signing in to Claude Code or its first-run folder-trust prompt.
+- A Ctrl-C that lands during interpreter shutdown after a successful capture exits with status -2 and no message (output and saved file are complete).
+- A second Ctrl-C in the microseconds before the handler ignores SIGINT could still escape with a traceback.
+- The `capture` CLI's missing-config message suggests "start the server with `--mock`"; for that subcommand it should say "add `--mock`".
+- `bench-vision capture` silences the server's own log, so an internal error's "details are in the server's stderr log" shows nothing there, and live-camera warnings (resolution mismatch, skipped inactive controls) are hidden.
+- `test_old_kernel_auto_switch_ordering_and_dropping` only checks ordering, despite its name.
+- `bench-vision capture` exits 0 when the capture couldn't be saved to captures/ (the WARNING text says so).

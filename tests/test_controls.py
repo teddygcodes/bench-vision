@@ -366,3 +366,26 @@ def test_setup_never_picks_undecodable_formats():
 
     fmts = [PixelFormat("H264", "H.264", {(3840, 2160): []}), PixelFormat("NV12", "NV12", {(1280, 720): []})]
     assert best_mode(fmts) == ("NV12", (1280, 720))
+
+
+def test_setup_locks_focus_with_old_kernel_names(tmp_path):
+    from fake_v4l2 import SIDE_CTRLS
+
+    old = SIDE_CTRLS.replace("focus_automatic_continuous", "focus_auto")
+    fake = FakeV4L2Ctl()
+    base = fake.__call__
+
+    def runner(argv):
+        if ("--list-ctrls-menus" in argv or "--list-ctrls" in argv) and SIDE_ID in " ".join(argv):
+            return 0, old, ""
+        return base(argv)
+
+    run_setup(tmp_path, v4l2=V4L2(runner), by_id_dir=make_by_id(tmp_path), out=io.StringIO())
+    side = load_config(tmp_path / "config.toml").cameras["side"]
+    assert side.v4l2_controls == (("focus_auto", 0), ("focus_absolute", 312))
+
+
+def test_old_kernel_auto_switch_ordering_and_dropping():
+    cam = CameraConfig("side", "/dev/v4l/by-id/x", v4l2_controls=(("focus_absolute", 300), ("focus_auto", 0)))
+    mgr = CameraManager({"side": cam}, None)
+    assert mgr.controls_for(cam) == [("focus_auto", 0), ("focus_absolute", 300)]

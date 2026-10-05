@@ -7,3 +7,4 @@ references/
 config.toml
 .bench-vision/
 references-mock/
+config.generated.toml

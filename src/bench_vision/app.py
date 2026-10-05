@@ -475,9 +475,11 @@ class BenchVision:
         controls = self.cameras.backend.list_ctrls(cfg)  # needs Linux/v4l2 for real cameras
         info = validate_control(controls, control, value, f"set_control on '{cam}'")
         if info.inactive:
+            focus_auto = "focus_auto" if "focus_auto" in controls else "focus_automatic_continuous"
             hint = {
-                "focus_absolute": "set focus_automatic_continuous=0 first",
+                "focus_absolute": f"set {focus_auto}=0 first",
                 "exposure_time_absolute": "set auto_exposure=1 (manual) first",
+                "exposure_absolute": "set exposure_auto=1 (manual) first",
             }.get(control, "turn off the matching automatic control first")
             raise BenchVisionError(f"{control} is inactive on '{cam}' right now; {hint}.")
         before = info.value
@@ -486,8 +488,12 @@ class BenchVision:
         overrides[control] = value
         dropped = ""
         # Turning an auto mode back on makes its manual value inactive; stop re-applying it.
+        # (auto switch -> manual control it gates, values where the manual control is inactive);
+        # older kernels use the names focus_auto / exposure_auto / exposure_absolute.
         dependent = {"focus_automatic_continuous": ("focus_absolute", lambda v: v == 1),
-                     "auto_exposure": ("exposure_time_absolute", lambda v: v not in (1, 2))}.get(control)
+                     "focus_auto": ("focus_absolute", lambda v: v == 1),
+                     "auto_exposure": ("exposure_time_absolute", lambda v: v not in (1, 2)),
+                     "exposure_auto": ("exposure_absolute", lambda v: v not in (1, 2))}.get(control)
         if dependent and dependent[1](value) and overrides.pop(dependent[0], None) is not None:
             dropped = f" (stopped re-applying {dependent[0]}, which is inactive in this mode)"
         rng = f"{info.min}..{info.max}" if info.min is not None and info.max is not None else "?"

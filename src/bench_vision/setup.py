@@ -97,9 +97,11 @@ def starter_config(devices: list[Device]) -> str:
         taken.add(name)
         controls = []
         focus = d.controls.get("focus_absolute")
-        if "focus_automatic_continuous" in d.controls and focus is not None:
+        # newer kernels: focus_automatic_continuous; older ones: focus_auto
+        auto = next((n for n in ("focus_automatic_continuous", "focus_auto") if n in d.controls), None)
+        if auto and focus is not None:
             # Autofocus hunts while you solder: lock it at the current position.
-            controls = ["focus_automatic_continuous=0", f"focus_absolute={focus.value or 0}"]
+            controls = [f"{auto}=0", f"focus_absolute={focus.value or 0}"]
         rendered = ", ".join(f'"{c}"' for c in controls)
         lines += [
             "",
