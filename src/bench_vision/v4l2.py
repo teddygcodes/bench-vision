@@ -36,6 +36,12 @@ class ControlInfo:
     def inactive(self) -> bool:
         return "inactive" in self.flags
 
+    @property
+    def read_only(self) -> bool:
+        # e.g. the TOMLOV (RaySmartTech VMS700B) lists focus controls as "read-only, write-only" with range 0..0;
+        # the driver refuses to set them (EACCES)
+        return "read-only" in self.flags
+
     def describe(self) -> str:
         if self.type == "bool":
             rng = "0/1"

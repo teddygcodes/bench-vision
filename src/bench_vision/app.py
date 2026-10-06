@@ -506,6 +506,8 @@ class BenchVision:
         if not isinstance(value, int) or isinstance(value, bool):
             raise BenchVisionError(f"value must be an integer; got {_short(value, 40)}.")
         controls = self.cameras.backend.list_ctrls(cfg)  # needs Linux/v4l2 for real cameras
+        if control in controls and controls[control].read_only:  # before range checks: the real reason
+            raise BenchVisionError(f"{control} is read-only on '{cam}': this camera doesn't let it be set.")
         info = validate_control(controls, control, value, f"set_control on '{cam}'")
         if info.inactive:
             focus_auto = "focus_auto" if "focus_auto" in controls else "focus_automatic_continuous"

@@ -18,7 +18,8 @@ from .v4l2 import V4L2, ControlInfo, PixelFormat, parse_formats, parse_list_ctrl
 # Preferred capture formats, best first (MJPG keeps 4K within USB 2 bandwidth).
 FOURCC_PREFERENCE = ("MJPG", "YUYV")
 UNDECODABLE = {"H264", "HEVC", "H265"}  # OpenCV's V4L2 backend can't decode these
-NAME_HINTS = (("arducam", "side"), ("tomlov", "scope"), ("microscope", "scope"))
+# The TOMLOV microscope reports itself as "RaySmartTech VMS700B" over USB.
+NAME_HINTS = (("arducam", "side"), ("tomlov", "scope"), ("microscope", "scope"), ("vms700", "scope"))
 
 
 @dataclass
@@ -99,7 +100,8 @@ def starter_config(devices: list[Device]) -> str:
         focus = d.controls.get("focus_absolute")
         # newer kernels: focus_automatic_continuous; older ones: focus_auto
         auto = next((n for n in ("focus_automatic_continuous", "focus_auto") if n in d.controls), None)
-        if auto and focus is not None:
+        settable = focus is not None and not focus.read_only and focus.min != focus.max
+        if auto and settable and not d.controls[auto].read_only:
             # Autofocus hunts while you solder: lock it at the current position.
             controls = [f"{auto}=0", f"focus_absolute={focus.value or 0}"]
         rendered = ", ".join(f'"{c}"' for c in controls)

@@ -11,7 +11,7 @@ from bench_vision import camera as camera_mod
 from bench_vision.app import BenchVision
 from bench_vision.camera import CameraManager, OpenCVBackend
 from bench_vision.config import CameraConfig, load_config
-from bench_vision.errors import CameraError
+from bench_vision.errors import BenchVisionError, CameraError
 from bench_vision.setup import run_setup
 from bench_vision.v4l2 import V4L2
 
@@ -465,3 +465,63 @@ def test_old_kernel_auto_switch_ordering_and_dropping():
     cam = CameraConfig("side", "/dev/v4l/by-id/x", v4l2_controls=(("focus_absolute", 300), ("focus_auto", 0)))
     mgr = CameraManager({"side": cam}, None)
     assert mgr.controls_for(cam) == [("focus_auto", 0), ("focus_absolute", 300)]
+
+
+# ------------------------------------------------- real TOMLOV (RaySmartTech VMS700B), from the bench
+
+VMS700B_ID = "usb-RaySmartTech_VMS700B_00.00.01-video-index0"
+VMS700B_CTRLS = """
+User Controls
+
+                white_balance_automatic 0x0098090c (bool)   : default=0 value=0 flags=read-only, write-only
+              white_balance_temperature 0x0098091a (int)    : min=2800 max=6500 step=1 default=4000 value=5000 flags=has-min-max
+
+Camera Controls
+
+                          auto_exposure 0x009a0901 (menu)   : min=0 max=3 default=3 value=3 (Aperture Priority Mode)
+                 exposure_time_absolute 0x009a0902 (int)    : min=1 max=2500 step=1 default=156 value=156 flags=inactive, has-min-max
+                         focus_absolute 0x009a090a (int)    : min=0 max=0 step=0 default=0 value=0 flags=read-only, write-only, has-min-max
+             focus_automatic_continuous 0x009a090c (bool)   : default=0 value=0 flags=read-only, write-only
+"""
+
+
+def test_tomlov_starter_config_is_scope_without_unsettable_focus():
+    from bench_vision.setup import Device, starter_config
+    from bench_vision.v4l2 import PixelFormat, parse_list_ctrls
+
+    ctrls = parse_list_ctrls(VMS700B_CTRLS)
+    assert ctrls["focus_absolute"].read_only and not ctrls["white_balance_temperature"].read_only
+    dev = Device(by_id=f"/dev/v4l/by-id/{VMS700B_ID}", target="/dev/video2",
+                 formats=[PixelFormat("MJPG", "Motion-JPEG", {(1920, 1080): [30.0], (1280, 720): [30.0]})],
+                 controls_raw=VMS700B_CTRLS, controls=ctrls)
+    toml = starter_config([dev])
+    assert "[cameras.scope]" in toml and "resolution = [1920, 1080]" in toml
+    assert "v4l2_controls = []" in toml  # its focus controls can't be set: don't write them
+
+
+def test_read_only_control_is_skipped_on_open_and_refused_by_set_control(tmp_path, clock):
+    class Ctl(FakeV4L2Ctl):
+        def __call__(self, argv):
+            if "--list-ctrls" in argv or "--list-ctrls-menus" in argv:
+                self.calls.append(argv)
+                return 0, VMS700B_CTRLS, ""
+            if any(a.startswith("--set-ctrl=focus") for a in argv):
+                self.calls.append(argv)
+                return 255, "", "VIDIOC_S_EXT_CTRLS: failed: Permission denied"
+            return super().__call__(argv)
+
+    fake = Ctl()
+    backend = OpenCVBackend(V4L2(fake))
+    cam = CameraConfig("scope", str(make_by_id(tmp_path) / SIDE_ID),
+                       v4l2_controls=(("focus_automatic_continuous", 0), ("focus_absolute", 0),
+                                      ("white_balance_temperature", 4500)))
+    assert backend._apply_controls(cam, list(cam.v4l2_controls)) == {"white_balance_temperature": 4500}
+    assert not any(a.startswith("--set-ctrl=focus") for a in sum(fake.calls, []))
+
+    live = tmp_path / "live"
+    live.mkdir()
+    bv, _ = _live(live, clock, Ctl())
+    with pytest.raises(BenchVisionError, match="focus_absolute is read-only on 'side'"):
+        bv.set_control("side", "focus_absolute", 0)
+    with pytest.raises(BenchVisionError, match="read-only"):  # not "out of range 0..0"
+        bv.set_control("side", "focus_absolute", 300)

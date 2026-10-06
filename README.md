@@ -301,6 +301,12 @@ All of these are git-ignored.
 
 ## Troubleshooting
 
+- **`Corrupt JPEG data: ... extraneous bytes before marker 0xd9` on every capture:** harmless. Some
+  cameras (the TOMLOV, which shows up as "RaySmartTech VMS700B") pad each MJPEG frame and libjpeg
+  warns about it on stderr; the frames decode fine and nothing reaches the MCP connection.
+- **A control in `v4l2_controls` is read-only on the camera** (`setup` lists it with `flags=read-only`,
+  e.g. the TOMLOV's focus): it is skipped with a warning on the server's stderr (the `capture` CLI
+  shows it; for the MCP server it's in Claude Code's MCP log); remove it from the list.
 - **`claude mcp list` shows bench-vision as failed:** the server didn't start at all (config mistakes
   don't cause this; they come back from each tool instead). Make sure you registered it from inside the
   `bench-vision` directory, that `uv` is on the PATH Claude Code uses, and that

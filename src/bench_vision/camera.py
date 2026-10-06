@@ -109,6 +109,9 @@ class OpenCVBackend:
         # Order matters: e.g. focus_automatic_continuous=0 must precede focus_absolute.
         for name, value in controls:
             info = validate_control(available, name, value, f"{cam.source} [cameras.{cam.name}] v4l2_controls")
+            if info.read_only:  # the driver refuses it (EACCES); don't fail every capture over it
+                log.warning("camera %s: skipping %s=%s (read-only on this camera)", cam.name, name, value)
+                continue
             if info.inactive:  # e.g. focus_absolute while autofocus is on: the driver would refuse it
                 log.warning("camera %s: skipping %s=%s (inactive while its auto mode is on)", cam.name, name, value)
                 continue
