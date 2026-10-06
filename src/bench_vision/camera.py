@@ -7,6 +7,7 @@ import logging
 import os
 import queue
 import threading
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
@@ -25,6 +26,17 @@ MOCK_EXTS = (".jpg", ".jpeg", ".png")
 OPEN_TIMEOUT = 5.0  # seconds for the device to open
 FRAME_TIMEOUT = 5.0  # seconds for each frame
 RELEASE_TIMEOUT = 5.0  # seconds to wait for the device to close after a capture
+# Auto-exposure needs time after the device opens: the Arducam's first ~10 frames keep the previous
+# exposure, then it takes ~1 s to settle (measured: mean brightness 5.5 at frame 5, 11 by 1.9 s).
+# So read until AE_SETTLE seconds after the first frame, then until the brightness holds steady
+# (AE_STEADY relative change over AE_STEADY_FRAMES), until at most AE_SETTLE_MAX seconds after the
+# first frame; it also stops after AE_BAD_READS failed reads in a row (e.g. unplugged mid-settle).
+# Skipped when the config/set_control puts exposure in manual mode.
+AE_SETTLE = 1.5
+AE_SETTLE_MAX = 2.5
+AE_STEADY = 0.03
+AE_STEADY_FRAMES = 5
+AE_BAD_READS = 3
 LOCK_TIMEOUT = 90.0  # longest a capture waits for another one to finish
 
 
@@ -145,6 +157,8 @@ class OpenCVBackend:
         events: queue.Queue = queue.Queue()
         abandon = threading.Event()
 
+        settle = not _manual_exposure(controls)
+
         def work() -> None:
             # Runs the blocking OpenCV calls so the caller can give up on a hung device.
             cap = None
@@ -157,11 +171,26 @@ class OpenCVBackend:
                 cap.set(cv2.CAP_PROP_FRAME_WIDTH, cam.resolution[0])
                 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, cam.resolution[1])
                 events.put(("controls", self._apply_controls(cam, controls)))
-                for _ in range(cam.warmup_frames):
+                first = None
+                means: list[float] = []
+                n = bad = 0
+                while True:
                     if abandon.is_set():
                         return
                     ok, img = cap.read()
-                    events.put(("frame", img if ok and img is not None and img.size > 0 else None))
+                    good = ok and img is not None and img.size > 0
+                    events.put(("frame", img if good else None))
+                    n += 1
+                    bad = 0 if good else bad + 1
+                    if n >= cam.warmup_frames and first is not None and bad >= AE_BAD_READS:
+                        log.warning("camera %s: reads failing while exposure settled; keeping the last good frame",
+                                    cam.name)
+                        return
+                    if good:
+                        first = first or time.monotonic()
+                        means.append(float(cv2.resize(img, (32, 24), interpolation=cv2.INTER_AREA).mean()))
+                    if n >= cam.warmup_frames and (not settle or first is None or _exposure_settled(means, first)):
+                        return
             except BaseException as e:  # noqa: BLE001 - handed to the caller
                 events.put(("error", e))
             finally:
@@ -190,6 +219,21 @@ class OpenCVBackend:
                 return None
             return value
 
+        def next_event(timeout: float, what: str) -> tuple[str, Any]:
+            nonlocal timed_out
+            try:
+                kind, value = events.get(timeout=timeout)
+            except queue.Empty:
+                timed_out = True
+                abandon.set()
+                raise CameraError(
+                    f"Camera '{cam.name}' ({cam.device}) did not {what} within {timeout:g} s; it may be hung. "
+                    "Unplug and replug it."
+                ) from None
+            if kind == "error":
+                raise value
+            return kind, value
+
         timed_out = False
         try:
             if not wait("opened", OPEN_TIMEOUT, "open"):
@@ -201,8 +245,10 @@ class OpenCVBackend:
             # Each v4l2-ctl call has its own timeout; allow for all of them.
             applied = wait("controls", OPEN_TIMEOUT + 2 * SUBPROCESS_TIMEOUT * (len(controls) + 1), "accept its controls")
             frame = None
-            for _ in range(cam.warmup_frames):
-                img = wait("frame", FRAME_TIMEOUT, "deliver a frame")
+            while True:  # frames until the worker is done (warm-up, then auto-exposure settling)
+                kind, img = next_event(FRAME_TIMEOUT, "deliver a frame")
+                if kind != "frame":
+                    break
                 if img is not None:
                     frame = img
         finally:
@@ -218,6 +264,22 @@ class OpenCVBackend:
         if (w, h) != cam.resolution:
             log.warning("camera %s: requested %sx%s, got %sx%s", cam.name, *cam.resolution, w, h)
         return Frame(cam.name, frame, applied or {})
+
+
+def _manual_exposure(controls: list[tuple[str, int]]) -> bool:
+    # auto_exposure (newer kernels) / exposure_auto (older): 1 = manual mode; the last setting applied wins
+    modes = [value for name, value in controls if name in ("auto_exposure", "exposure_auto")]
+    return bool(modes) and modes[-1] == 1
+
+
+def _exposure_settled(means: list[float], first: float) -> bool:
+    elapsed = time.monotonic() - first
+    if elapsed >= AE_SETTLE_MAX:
+        return True
+    if elapsed < AE_SETTLE or len(means) < AE_STEADY_FRAMES:
+        return False
+    recent = means[-AE_STEADY_FRAMES:]
+    return max(recent) - min(recent) <= max(1.0, AE_STEADY * max(recent))
 
 
 class OpenCVStream:

@@ -254,6 +254,83 @@ def test_normal_capture_is_unaffected_by_timeouts(tmp_path, monkeypatch, fast_ti
     assert mgr.capture("scope").size == (8, 8)
 
 
+class DarkThenBrightCap(SlowCap):
+    """Like the Arducam with auto-exposure: ~10 frames at the old exposure, then brightening for ~0.4 s."""
+    read_delay = 0.02
+
+    def __init__(self, *a):
+        self.t0 = None
+
+    def read(self):
+        time.sleep(self.read_delay)
+        now = time.monotonic()
+        self.t0 = self.t0 or now
+        level = 50 + min(1.0, max(0.0, (now - self.t0 - 0.2) / 0.4)) * 50  # 50 -> 100 between 0.2 and 0.6 s
+        return True, np.full((8, 8, 3), level, np.uint8)
+
+
+def test_capture_waits_for_auto_exposure_to_settle(tmp_path, monkeypatch):
+    monkeypatch.setattr(camera_mod, "AE_SETTLE", 0.7)
+    monkeypatch.setattr(camera_mod, "AE_SETTLE_MAX", 2.0)
+    mgr = _manager(tmp_path, DarkThenBrightCap, monkeypatch)
+    t0 = time.monotonic()
+    frame = mgr.capture("side")
+    assert frame.image.mean() >= 99 and time.monotonic() - t0 < 1.5  # settled, not the first (dark) frames
+
+
+def test_manual_exposure_skips_settling(tmp_path, monkeypatch):
+    monkeypatch.setattr(camera_mod, "AE_SETTLE", 5.0)
+    monkeypatch.setattr(camera_mod, "AE_SETTLE_MAX", 5.0)
+    mgr = _manager(tmp_path, DarkThenBrightCap, monkeypatch)
+    side = mgr.cameras["side"]
+    mgr.cameras["side"] = CameraConfig(**{**side.__dict__, "v4l2_controls": (("auto_exposure", 1),)})
+    monkeypatch.setattr(mgr.backend, "_apply_controls", lambda cam, controls: dict(controls))
+    t0 = time.monotonic()
+    frame = mgr.capture("side")
+    assert time.monotonic() - t0 < 1.0 and frame.image.mean() < 60  # just the warm-up frames
+
+
+def test_failed_reads_end_settling_with_the_last_good_frame(tmp_path, monkeypatch):
+    class Unplugged(SlowCap):  # 8 good frames, then every read fails at once
+        n = 0
+
+        def read(self):
+            Unplugged.n += 1
+            return (True, np.full((8, 8, 3), 77, np.uint8)) if Unplugged.n <= 8 else (False, None)
+
+    monkeypatch.setattr(camera_mod, "AE_SETTLE", 5.0)
+    monkeypatch.setattr(camera_mod, "AE_SETTLE_MAX", 5.0)
+    mgr = _manager(tmp_path, Unplugged, monkeypatch)
+    t0 = time.monotonic()
+    frame = mgr.capture("side")
+    assert time.monotonic() - t0 < 1.0 and frame.image.mean() == 77 and Unplugged.n < 20
+
+
+def test_last_exposure_mode_wins():
+    from bench_vision.camera import _manual_exposure
+
+    assert _manual_exposure([("auto_exposure", 1)]) and _manual_exposure([("exposure_auto", 1)])
+    assert not _manual_exposure([("auto_exposure", 1), ("auto_exposure", 3)]) and not _manual_exposure([])
+
+
+def test_settling_is_capped(tmp_path, monkeypatch):
+    class Flicker(SlowCap):  # never steady
+        read_delay = 0.02
+        n = 0
+
+        def read(self):
+            time.sleep(self.read_delay)
+            Flicker.n += 1
+            return True, np.full((8, 8, 3), 40 if Flicker.n % 2 else 120, np.uint8)
+
+    monkeypatch.setattr(camera_mod, "AE_SETTLE", 0.2)
+    monkeypatch.setattr(camera_mod, "AE_SETTLE_MAX", 0.6)
+    mgr = _manager(tmp_path, Flicker, monkeypatch)
+    t0 = time.monotonic()
+    mgr.capture("side")
+    assert 0.55 < time.monotonic() - t0 < 1.5
+
+
 def test_non_utf8_v4l2_output_does_not_crash(tmp_path, monkeypatch):
     """uvcvideo can truncate a product name mid-character; the report must still come out."""
     import subprocess as sp

@@ -38,6 +38,15 @@ class Clock:
         return self.t
 
 
+@pytest.fixture(autouse=True)
+def no_exposure_settling(monkeypatch):
+    """Fake cameras don't have auto-exposure; tests that check settling turn it back on."""
+    from bench_vision import camera
+
+    monkeypatch.setattr(camera, "AE_SETTLE", 0.0)
+    monkeypatch.setattr(camera, "AE_SETTLE_MAX", 0.0)
+
+
 @pytest.fixture
 def root(tmp_path: Path) -> Path:
     make_image(tmp_path / "mock" / "scope.png", 1920, 1080, seed=1)

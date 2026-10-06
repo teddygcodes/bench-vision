@@ -112,3 +112,8 @@ triggering another review round; none affects results, data, or error handling.
 - On a filesystem without flock, concurrent captures from different processes can lose updates to capture.<cam>.json (the camera itself isn't exclusive there either).
 - A cv2.error raised by VideoCapture() itself is reported as "stopped delivering frames" and doesn't count as a failed open for the live-view back-off.
 - The display's separate retry delay after a reader crash (not a missing camera) isn't cut short by a successful capture.
+
+## Real hardware (bench, Arducam)
+- Exposure settling (AE_SETTLE 1.5 s / AE_SETTLE_MAX 2.5 s / 3% steady over 5 frames) is tuned from the Arducam alone; a camera without auto exposure, or in shutter-priority mode (2), still pays ~1.5 s per capture (could skip when list_ctrls has no auto_exposure/exposure_auto).
+- A single read stalling > 5 s while exposure settles fails the whole capture even though warm-up frames are in hand (fails safely with the usual timeout message).
+- The settling tests use wall-clock bounds and could flake on a heavily loaded machine.
