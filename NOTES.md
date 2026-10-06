@@ -119,3 +119,4 @@ triggering another review round; none affects results, data, or error handling.
 - The settling tests use wall-clock bounds and could flake on a heavily loaded machine.
 - Config controls skipped as read-only or inactive are only logged to the server's stderr; the capture reply and sidecar don't say so (the sidecar's `controls` just lacks them).
 - set_control reads the value back after setting it; a control that is write-only but not read-only would fail the read-back (EACCES) after the set worked. The TOMLOV's write-only controls are all read-only too, so it doesn't happen today.
+- Controls are applied after one priming frame and then CONTROL_FRAMES=8 frames are read; with OpenCV's 4-buffer queue the kept frame is ~3-4 frames after the writes. Raise it if long manual exposures ever show partial changes. No test yet for a hang on a later warm-up read or for the priming read returning ok=False (same code paths as covered ones).

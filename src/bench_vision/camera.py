@@ -37,6 +37,11 @@ AE_SETTLE_MAX = 2.5
 AE_STEADY = 0.03
 AE_STEADY_FRAMES = 5
 AE_BAD_READS = 3
+# Controls are applied only once the stream is running: the Arducam drops auto_exposure/exposure values
+# set before stream-on (it starts streaming in auto exposure), and a change shows after 4-5 frames
+# (the frames already queued). So: read one frame, apply the controls, then read at least
+# CONTROL_FRAMES more before keeping one.
+CONTROL_FRAMES = 8
 LOCK_TIMEOUT = 90.0  # longest a capture waits for another one to finish
 
 
@@ -173,7 +178,12 @@ class OpenCVBackend:
                 cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*cam.fourcc))
                 cap.set(cv2.CAP_PROP_FRAME_WIDTH, cam.resolution[0])
                 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, cam.resolution[1])
+                cap.read()  # start the stream first (see CONTROL_FRAMES)
+                events.put(("streaming", None))
+                if abandon.is_set():
+                    return
                 events.put(("controls", self._apply_controls(cam, controls)))
+                need = max(cam.warmup_frames, CONTROL_FRAMES if controls else 0)
                 first = None
                 means: list[float] = []
                 n = bad = 0
@@ -185,14 +195,14 @@ class OpenCVBackend:
                     events.put(("frame", img if good else None))
                     n += 1
                     bad = 0 if good else bad + 1
-                    if n >= cam.warmup_frames and first is not None and bad >= AE_BAD_READS:
+                    if n >= need and first is not None and bad >= AE_BAD_READS:
                         log.warning("camera %s: reads failing while exposure settled; keeping the last good frame",
                                     cam.name)
                         return
                     if good:
                         first = first or time.monotonic()
                         means.append(float(cv2.resize(img, (32, 24), interpolation=cv2.INTER_AREA).mean()))
-                    if n >= cam.warmup_frames and (not settle or first is None or _exposure_settled(means, first)):
+                    if n >= need and (not settle or first is None or _exposure_settled(means, first)):
                         return
             except BaseException as e:  # noqa: BLE001 - handed to the caller
                 events.put(("error", e))
@@ -245,6 +255,8 @@ class OpenCVBackend:
                     "Is another program (cheese, OBS, a second bench-vision) using it, and is your "
                     "user in the 'video' group?"
                 )
+            if next_event(FRAME_TIMEOUT, "deliver a frame")[0] != "streaming":
+                raise CameraError(f"Camera '{cam.name}' ({cam.device}) opened but did not start streaming.")
             # Each v4l2-ctl call has its own timeout; allow for all of them.
             applied = wait("controls", OPEN_TIMEOUT + 2 * SUBPROCESS_TIMEOUT * (len(controls) + 1), "accept its controls")
             frame = None
@@ -299,6 +311,11 @@ class OpenCVStream:
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, cam.resolution[0])
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, cam.resolution[1])
         self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # we read slower than the camera: keep frames fresh
+        try:
+            self.cap.read()  # start the stream before open_stream applies the controls (see CONTROL_FRAMES)
+        except BaseException:
+            self.cap.release()
+            raise
 
     def read(self) -> np.ndarray | None:
         ok, img = self.cap.read()

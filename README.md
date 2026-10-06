@@ -250,9 +250,11 @@ device = "/dev/v4l/by-id/usb-Arducam_..._video-index0"   # never bare /dev/video
 resolution = [3840, 2160]
 fourcc = "MJPG"
 default_rotation = 0              # clockwise: 0, 90, 180 or 270
-warmup_frames = 5                 # frames grabbed at least (the last is kept); with auto exposure a capture
-                                  # keeps reading ~1.5-2.5 s until brightness settles (skipped when exposure
-                                  # is manual: auto_exposure=1 / exposure_auto=1, in config or set_control)
+warmup_frames = 5                 # frames grabbed at least (the last is kept), after one frame that starts the
+                                  # stream; v4l2_controls are applied once it streams (some cameras drop
+                                  # exposure set earlier), then at least 8 frames are read; with auto exposure
+                                  # a capture keeps reading ~1.5-2.5 s until brightness settles (skipped when
+                                  # exposure is manual: auto_exposure=1 / exposure_auto=1, config or set_control)
 v4l2_controls = ["focus_automatic_continuous=0", "focus_absolute=300"]   # applied in order at every open
 ```
 

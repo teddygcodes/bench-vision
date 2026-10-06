@@ -525,3 +525,46 @@ def test_read_only_control_is_skipped_on_open_and_refused_by_set_control(tmp_pat
         bv.set_control("side", "focus_absolute", 0)
     with pytest.raises(BenchVisionError, match="read-only"):  # not "out of range 0..0"
         bv.set_control("side", "focus_absolute", 300)
+
+
+# --------------------------------- controls after stream-on (Arducam drops exposure set before it)
+
+def _recording(tmp_path, monkeypatch):
+    log = []
+
+    class Cap(SlowCap):
+        def read(self):
+            log.append("read")
+            return True, np.zeros((8, 8, 3), np.uint8)
+
+    class Ctl(FakeV4L2Ctl):
+        def __call__(self, argv):
+            if any(a.startswith("--set-ctrl=") for a in argv):
+                log.append(next(a for a in argv if a.startswith("--set-ctrl=")))
+            return super().__call__(argv)
+
+    monkeypatch.setattr(camera_mod.cv2, "VideoCapture", Cap)
+    by_id = make_by_id(tmp_path)
+    cam = CameraConfig("side", str(by_id / SIDE_ID), resolution=(8, 8),
+                       v4l2_controls=(("focus_automatic_continuous", 0), ("focus_absolute", 300)))
+    return log, OpenCVBackend(V4L2(Ctl())), cam
+
+
+def test_capture_applies_controls_after_the_stream_starts(tmp_path, monkeypatch):
+    log, backend, cam = _recording(tmp_path, monkeypatch)
+    backend.grab(cam, list(cam.v4l2_controls))
+    sets = [i for i, e in enumerate(log) if e.startswith("--set-ctrl=")]
+    assert log[0] == "read" and sets and min(sets) > 0  # one frame first (stream on), then the controls
+    assert log[max(sets) + 1:].count("read") >= camera_mod.CONTROL_FRAMES  # then let them take effect
+
+
+def test_capture_without_controls_keeps_the_usual_warmup(tmp_path, monkeypatch):
+    log, backend, cam = _recording(tmp_path, monkeypatch)
+    backend.grab(cam, [])
+    assert log.count("read") == 1 + cam.warmup_frames
+
+
+def test_live_stream_applies_controls_after_the_stream_starts(tmp_path, monkeypatch):
+    log, backend, cam = _recording(tmp_path, monkeypatch)
+    backend.open_stream(cam, list(cam.v4l2_controls)).close()
+    assert log[0] == "read" and any(e.startswith("--set-ctrl=") for e in log[1:])
