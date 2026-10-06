@@ -16,7 +16,7 @@ import numpy as np
 from PIL import Image as PILImage
 
 from .config import NAME_RE, CameraConfig
-from .errors import CameraError
+from .errors import CameraError, CameraMissingError, CameraOpenError
 from .v4l2 import SUBPROCESS_TIMEOUT, V4L2, ControlInfo, validate_control
 
 log = logging.getLogger(__name__)
@@ -56,7 +56,7 @@ def is_auto_switch(name: str) -> bool:
 
 
 def missing_device_error(cam: CameraConfig) -> CameraError:
-    return CameraError(
+    return CameraMissingError(
         f"Camera '{cam.name}' is not connected: {cam.source} [cameras.{cam.name}] device = "
         f"\"{cam.device}\" does not exist. Check the USB cable, or run `uv run bench-vision setup` "
         "to list the by-id paths that are present now."
@@ -180,7 +180,7 @@ class OpenCVBackend:
                 nonlocal timed_out
                 timed_out = True
                 abandon.set()
-                raise CameraError(
+                raise (CameraOpenError if expect == "opened" else CameraError)(
                     f"Camera '{cam.name}' ({cam.device}) did not {what} within {timeout:g} s; it may be hung. "
                     "Unplug and replug it."
                 ) from None
@@ -193,7 +193,7 @@ class OpenCVBackend:
         timed_out = False
         try:
             if not wait("opened", OPEN_TIMEOUT, "open"):
-                raise CameraError(
+                raise CameraOpenError(
                     f"Camera '{cam.name}' ({cam.device}) exists but could not be opened. "
                     "Is another program (cheese, OBS, a second bench-vision) using it, and is your "
                     "user in the 'video' group?"
@@ -229,7 +229,7 @@ class OpenCVStream:
         self.cap = cv2.VideoCapture(real, cv2.CAP_V4L2)
         if not self.cap.isOpened():
             self.cap.release()
-            raise CameraError(f"Camera '{cam.name}' ({cam.device}) could not be opened for the live view.")
+            raise CameraOpenError(f"Camera '{cam.name}' ({cam.device}) could not be opened for the live view.")
         self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*cam.fourcc))
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, cam.resolution[0])
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, cam.resolution[1])
@@ -352,7 +352,7 @@ class MockBackend:
     def _require(self, cam: CameraConfig) -> list[Path]:
         imgs = self.images_for(cam.name)
         if not imgs:
-            raise CameraError(
+            raise CameraMissingError(
                 f"Mock camera '{cam.name}' has no image: put {cam.name}.jpg (or a {cam.name}/ folder "
                 f"of images) in {self.mock_dir}."
             )

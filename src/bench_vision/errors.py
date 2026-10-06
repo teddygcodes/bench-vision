@@ -16,3 +16,11 @@ class ConfigError(BenchVisionError):
 
 class CameraError(BenchVisionError):
     """A camera could not be opened or read."""
+
+
+class CameraOpenError(CameraError):
+    """The camera is missing or could not be opened (as opposed to failing after it opened)."""
+
+
+class CameraMissingError(CameraOpenError):
+    """The camera's device isn't there at all (unplugged, wrong by-id path, mock image missing)."""

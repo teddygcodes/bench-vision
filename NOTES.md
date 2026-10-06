@@ -108,4 +108,8 @@ triggering another review round; none affects results, data, or error handling.
 - After a reader dies from a signal, the status may show its last stderr line (a warning) rather than "camera reader exited (-9)".
 - The live-view open error lacks the capture error's "another program / video group?" hint.
 - Run by hand with stdin closed, the reader exits 0 silently; with stdin = /dev/zero its watcher spins. Under the display stdin is always a pipe.
-- Each capture during a live-view back-off both retries the camera at once and moves the back-off one step on, so a few captures take the wait to 30 s (a replug is still noticed within ~1 s).
+- Capture outcomes are matched by wall-clock time across processes; an NTP step backwards during a capture can drop that outcome (no change to the back-off).
+- On a filesystem without flock, concurrent captures from different processes can lose updates to capture.<cam>.json (the camera itself isn't exclusive there either).
+- A cv2.error raised by VideoCapture() itself is reported as "stopped delivering frames" and doesn't count as a failed open for the live-view back-off.
+- The display's separate retry delay after a reader crash (not a missing camera) isn't cut short by a successful capture.
+- tests/test_stdio.py::test_ctrl_c_is_one_line_even_twice is occasionally flaky under heavy load (the SIGINT during the paused import is lost); it passes on its own.

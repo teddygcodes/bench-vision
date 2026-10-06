@@ -99,7 +99,7 @@ def _display(args: argparse.Namespace) -> int:
             command.append("--mock")
         if args.config:
             command += ["--config", str(Path(args.config).resolve())]
-        live, cam_name, idle = LiveStream(command, lock), cam.name, cfg.live_idle_seconds
+        live, cam_name, idle = LiveStream(command, lock, cam=cam.name), cam.name, cfg.live_idle_seconds
     try:
         server, _ = make_server(args.host, args.port, root=root, live=live, live_cam=cam_name, live_size=size,
                                 live_idle=idle)

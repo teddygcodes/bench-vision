@@ -1,13 +1,16 @@
 """Child process that reads the live camera for `bench-vision display`.
 
-    python -m bench_vision.livereader --root DIR [--mock] [--config FILE] --cam NAME [--attempt N]
+    python -m bench_vision.livereader --root DIR [--mock] [--config FILE] --cam NAME [--attempt N] [--wait S [--wait-missing]]
 
 Writes frames to stdout as <4-byte big-endian length><JPEG>, at most MAX_FPS, rotated like
 captures and scaled to a LONG_EDGE long edge. If the camera is missing, won't open, or stops
 delivering frames (unplugged), it prints a `status: unavailable: ...` line to stderr and tries
 again itself after RETRY_DELAYS (3 s, 6 s, 12 s, 24 s, then every 30 s; back to 3 s once frames
-flow), so the display doesn't start a new process for each attempt. --attempt continues the back-off
-of a reader the display stopped for a capture. Errors no retry can fix (bad
+flow), so the display doesn't start a new process for each attempt. --attempt and --wait (seconds
+before the first try) continue the back-off of a reader the display stopped for a capture;
+--wait-missing ends that wait as soon as the (last seen missing) device is present. Before each
+`status: unavailable: ...` line (for people) it prints `backoff: missing=yes|no retry=<seconds>` (for
+the display). Errors no retry can fix (bad
 config, unknown camera) print one line and exit with status 3. It exits when stdin closes (the
 display went away). The display kills this process to free the camera for a capture, so the kernel
 has closed the device before the camera lock is released.
@@ -47,6 +50,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--mock", action="store_true")
     p.add_argument("--config")
     p.add_argument("--attempt", type=int, default=0)
+    p.add_argument("--wait", type=float, default=0.0)
+    p.add_argument("--wait-missing", action="store_true")
     args = p.parse_args(argv)
     os.environ["OPENCV_LOG_LEVEL"] = "WARNING"
 
@@ -87,17 +92,26 @@ def main(argv: list[str] | None = None) -> int:
         except Exception:  # noqa: BLE001
             return False
 
-    def unavailable(why: str, attempt: int) -> None:
-        _say(f"{STATUS}unavailable: {' '.join(why.split())} (retrying in {retry_delay(attempt):g} s)")
+    def pause(seconds: float, missing: bool) -> None:
         # Sleep, but retry at once if a missing device reappears (replugged) instead of waiting up to 30 s.
-        missing = not present()
-        end = time.monotonic() + retry_delay(attempt)
-        while time.monotonic() < end:
-            time.sleep(min(PRESENCE_CHECK, max(0.0, end - time.monotonic())))
-            if missing and present():
+        end = time.monotonic() + seconds
+        while not (missing and present()):
+            left = end - time.monotonic()
+            if left <= 0:
                 return
+            time.sleep(min(PRESENCE_CHECK, left))
+
+    def unavailable(why: str, attempt: int) -> None:
+        missing = not present()
+        why = " ".join(why.split())
+        why = why if len(why) <= 240 else why[:239] + "…"  # the display shows 300 chars: keep the retry time
+        _say(f"backoff: missing={'yes' if missing else 'no'} retry={retry_delay(attempt):g}")
+        _say(f"{STATUS}unavailable: {why} (retrying in {retry_delay(attempt):g} s)")
+        pause(retry_delay(attempt), missing)
 
     attempt = max(0, args.attempt)
+    if args.wait > 0:  # the rest of a back-off delay that a capture interrupted
+        pause(min(args.wait, RETRY_DELAYS[-1]), args.wait_missing)
     while True:
         try:
             bv.load_shared_overrides()  # pick up set_control values made since the last attempt

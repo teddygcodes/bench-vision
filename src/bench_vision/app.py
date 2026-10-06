@@ -136,7 +136,7 @@ class BenchVision:
         cams = self.config.cameras if self.config else {}
         from .camlock import CameraLock
 
-        self.cameras = CameraManager(cams, backend, CameraLock(root / ".bench-vision"))
+        self.cameras = CameraManager(cams, backend, CameraLock(root / ".bench-vision", mock=mock))
         # Kept out of captures/ (only images + sidecars there); mock and live never share grids.
         self.references = ReferenceStore(root / ("references-mock" if mock else "references"))
         self.grids = GridStore(root / ".bench-vision" / ("grids-mock.json" if mock else "grids.json"))

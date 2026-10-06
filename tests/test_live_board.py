@@ -496,11 +496,15 @@ def _start_reader(root, *extra, patch=""):
 
 
 def _lines_with_times(stream, n, timeout):
+    """The first n `status:` lines (with arrival times); `backoff:` lines are skipped."""
     got, done = [], threading.Event()
 
     def read():
         for raw in stream:
-            got.append((time.monotonic(), raw.decode().strip()))
+            line = raw.decode().strip()
+            if line.startswith("backoff: "):
+                continue
+            got.append((time.monotonic(), line))
             if len(got) >= n:
                 break
         done.set()
@@ -585,13 +589,84 @@ def test_live_reader_exits_once_on_a_config_error(root):
     assert not any(e.startswith("status:") or "Fatal" in e or "Traceback" in e for e in err)
 
 
-def test_display_starts_one_reader_for_a_missing_camera_and_shows_status(root, monkeypatch):
+def test_capture_outcomes_are_recorded_per_camera(tmp_path):
+    from bench_vision.errors import CameraError, CameraMissingError, CameraOpenError
+
+    lock = CameraLock(tmp_path)
+    t0 = time.time() - 0.001
+    assert lock.outcomes_since("scope", t0) == (False, [], False, t0)
+    with lock.for_capture("scope"):
+        pass
+    reset, fails, _, latest = lock.outcomes_since("scope", t0)
+    assert reset and fails == [] and latest > t0
+    assert lock.outcomes_since("side", t0)[:2] == (False, [])
+    with pytest.raises(CameraOpenError), lock.for_capture("scope"):
+        raise CameraOpenError("could not be opened")
+    with pytest.raises(CameraError), lock.for_capture("scope"):
+        raise CameraError("no frames")  # opened, then failed: neither a success nor a failed open
+    with pytest.raises(CameraOpenError), lock.for_capture("scope"):
+        raise CameraMissingError("not connected")
+    reset, fails, missing, latest = lock.outcomes_since("scope", t0)
+    assert reset and len(fails) == 2 and missing and latest == fails[-1]  # ok, then two failed opens
+    assert lock.outcomes_since("scope", latest) == (False, [], True, latest)  # all applied
+    with lock.for_capture("scope"):
+        pass
+    assert lock.outcomes_since("scope", latest)[:2] == (True, [])  # a success clears the failures
+    lock.outcome_path("scope").write_text('{"ok_time": 1' + "0" * 400 + '}')
+    assert lock.outcomes_since("scope", t0)[:2] == (False, [])  # corrupt (huge time): ignored, no exception
+
+
+def test_several_captures_between_reader_starts_all_count(tmp_path):
+    from bench_vision.errors import CameraError, CameraOpenError
+    from bench_vision.livereader import retry_delay
+
+    def stream_at_step(n):
+        stream = LiveStream(None, CameraLock(tmp_path), cam="scope")
+        stream._attempts, stream._fixed_unavailable = n, False
+        return stream
+
+    # ok, then opened-but-failed: the success still resets the back-off
+    stream = stream_at_step(4)
+    with stream.lock.for_capture("scope"):
+        pass
+    with pytest.raises(CameraError), stream.lock.for_capture("scope"):
+        raise CameraError("no frames")
+    stream._apply_capture_outcome()
+    assert stream._attempts == 0 and stream._next_try == 0.0
+    # ok, then a failed open: reset, then one failed try (3 s from that failure)
+    stream = stream_at_step(4)
+    with stream.lock.for_capture("scope"):
+        pass
+    with pytest.raises(CameraOpenError), stream.lock.for_capture("scope"):
+        raise CameraOpenError("busy")
+    stream._apply_capture_outcome()
+    assert stream._attempts == 1 and 0 < stream._next_try - time.monotonic() <= retry_delay(0)
+
+
+def test_live_reader_waits_out_the_rest_of_an_interrupted_delay(root):
+    (root / "config.toml").write_text('[cameras.scope]\ndevice = "/dev/v4l/by-id/not-plugged-in"\n')
+    t0 = time.monotonic()
+    proc = _start_reader(root, "--attempt", "1", "--wait", "0.7")  # (capped at the longest delay, 0.8 here)
+    try:
+        lines = _lines_with_times(proc.stderr, 1, timeout=30)
+    finally:
+        proc.kill()
+    assert lines and lines[0][0] - t0 >= 0.7 and lines[0][1].endswith("(retrying in 0.4 s)")
+
+
+TWO_CAMS = ('[cameras.scope]\ndevice = "/dev/v4l/by-id/scope-video-index0"\nresolution = [1920, 1080]\n\n'
+            '[cameras.side]\ndevice = "/dev/v4l/by-id/side-video-index0"\nresolution = [3840, 2160]\n')
+
+
+@pytest.fixture
+def steered(root, monkeypatch):
+    """Live view of a missing 'scope' (real reader, real delays) with every reader command recorded."""
+    import shutil
     import subprocess
     import sys
 
-    (root / "config.toml").write_text('[cameras.scope]\ndevice = "/dev/v4l/by-id/not-plugged-in"\n')
-    code = (f"import os, sys; from bench_vision import livereader; livereader.RETRY_DELAYS = {FAST_RETRY}; "
-            "c = livereader.main(); sys.stderr.flush(); os._exit(c)")
+    (root / "config.toml").write_text(TWO_CAMS)
+    shutil.move(root / "mock" / "scope.png", root / "scope.png")  # the live camera is unplugged
     spawned = []
     real_popen = subprocess.Popen
 
@@ -600,25 +675,158 @@ def test_display_starts_one_reader_for_a_missing_camera_and_shows_status(root, m
         return real_popen(cmd, **kw)
 
     monkeypatch.setattr(live_mod.subprocess, "Popen", popen)
-    stream = LiveStream([sys.executable, "-c", code, "--root", str(root), "--cam", "scope"],
-                        CameraLock(root / ".bench-vision"))
+    stream = LiveStream([sys.executable, "-m", "bench_vision.livereader", "--root", str(root), "--cam", "scope",
+                         "--mock"], CameraLock(root / ".bench-vision", mock=True), cam="scope")
+    tokens = [stream.attach()]
+    yield stream, spawned, BenchVision(root, mock=True), tokens
+    for t in tokens:
+        stream.detach(t)
+    time.sleep(live_mod.IDLE_STOP + 0.5)
+
+
+def _replug(root):
+    import shutil
+
+    shutil.move(root / "scope.png", root / "mock" / "scope.png")
+
+
+def _args_of(cmd):
+    return int(cmd[cmd.index("--attempt") + 1]), float(cmd[cmd.index("--wait") + 1]), "--wait-missing" in cmd
+
+
+def _wait_for(cond, timeout=10):
+    deadline = time.monotonic() + timeout
+    while not cond() and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert cond()
+
+
+def test_capture_outcomes_steer_the_live_back_off(root, steered):
+    """Missing live camera: a capture of another camera leaves the back-off alone, a capture that can't open
+    the live camera counts as a failed try, and one that works resets it and the live view comes back."""
+    from bench_vision.errors import CameraMissingError
+    from bench_vision.livereader import retry_delay
+
+    stream, spawned, bv, _ = steered
+    _wait_for(lambda: stream._attempts == 1)  # first try failed: waiting 3 s
+    assert len(spawned) == 1 and _args_of(spawned[0]) == (0, 0.0, False)
+
+    bv.cameras.capture("side")  # works, but says nothing about the live camera
+    _wait_for(lambda: len(spawned) == 2)
+    attempt, wait, missing = _args_of(spawned[1])
+    assert attempt == 1 and 1.5 < wait <= 3.0 and missing  # same step, rest of the current delay
+    assert "unavailable" in stream.status and "retrying in" in stream.status
+
+    with pytest.raises(CameraMissingError):
+        bv.cameras.capture("scope")  # can't open the live camera: one more failed try
+    _wait_for(lambda: len(spawned) == 3)
+    attempt, wait, missing = _args_of(spawned[2])
+    assert attempt == 2 and retry_delay(1) - 1 < wait <= retry_delay(1) and missing
+
+    _replug(root)
+    bv.cameras.capture("scope")  # works: back-off reset, retry at once
+    _wait_for(lambda: len(spawned) == 4)
+    assert _args_of(spawned[3]) == (0, 0.0, False)
+    _wait_for(lambda: stream.status == "live")
+    assert stream._attempts == 0
+
+
+def test_replug_while_the_live_view_is_stopped_is_noticed_at_once(root, steered):
+    """The camera comes back during a capture of the other camera, or while no page watches: the next reader
+    must not sit out the rest of the delay."""
+    stream, spawned, bv, tokens = steered
+    _wait_for(lambda: stream._attempts == 2, timeout=15)  # waiting 6 s now
+    with CameraLock(root / ".bench-vision").for_capture("side"):
+        _replug(root)  # plugged back in while the live view has given up the camera
+    t0 = time.monotonic()
+    _wait_for(lambda: stream.status == "live", timeout=10)
+    assert time.monotonic() - t0 < 2.5 and _args_of(spawned[-1])[2]
+
+
+def test_long_device_path_keeps_the_back_off_across_other_captures(root, monkeypatch):
+    """A realistic by-id path makes the status line long; the display must still know the remaining wait."""
+    import subprocess
+    import sys
+
+    long_path = "/dev/v4l/by-id/usb-Sonix_Technology_Co.__Ltd._USB_2.0_Microscope_Camera_SN0001-video-index0"
+    (root / "config.toml").write_text(TWO_CAMS.replace("/dev/v4l/by-id/scope-video-index0", long_path))
+    spawned = []
+    real_popen = subprocess.Popen
+
+    def popen(cmd, **kw):
+        spawned.append(cmd)
+        return real_popen(cmd, **kw)
+
+    monkeypatch.setattr(live_mod.subprocess, "Popen", popen)
+    stream = LiveStream([sys.executable, "-m", "bench_vision.livereader", "--root", str(root), "--cam", "scope"],
+                        CameraLock(root / ".bench-vision"), cam="scope")
     token = stream.attach()
     try:
-        deadline = time.monotonic() + 15
-        while "retrying in 0.8 s" not in stream.status and time.monotonic() < deadline:
-            time.sleep(0.05)
-        assert stream.status.startswith("unavailable: Camera 'scope' is not connected")
-        assert len(spawned) == 1 and spawned[0][-2:] == ["--attempt", "0"]
-        # a capture interrupts the reader; the next one carries on with the back-off
-        with CameraLock(root / ".bench-vision").for_capture("side"):
-            pass
-        deadline = time.monotonic() + 10
-        while len(spawned) < 2 and time.monotonic() < deadline:
-            time.sleep(0.05)
-        assert len(spawned) == 2 and int(spawned[1][-1]) >= 3
+        _wait_for(lambda: stream._attempts == 1)
+        assert "(retrying in 3 s)" in stream.status  # visible on the page despite the long reason
+        for n in range(2):
+            with CameraLock(root / ".bench-vision").for_capture("side"):
+                pass
+            _wait_for(lambda: len(spawned) == n + 2)
+            attempt, wait, missing = _args_of(spawned[-1])
+            assert attempt == 1 and wait > 0.5 and missing  # no retry-at-once, no extra step
+        assert stream._attempts == 1
     finally:
         stream.detach(token)
         time.sleep(live_mod.IDLE_STOP + 0.5)
+
+
+def test_successful_capture_while_no_page_watches_resets_the_back_off(root, monkeypatch):
+    """Camera present but busy (so a replug check can't help): back-off grows, the page stops watching
+    (as for 20 s after a `show`), a capture of it works, the page comes back -> retry at once from 3 s."""
+    import subprocess
+    import sys
+
+    (root / "config.toml").write_text(TWO_CAMS)
+    busy = root / "busy"
+    busy.touch()
+    code = ("import os, sys; from pathlib import Path; from bench_vision import livereader, camera; "
+            "from bench_vision.errors import CameraOpenError; real = camera.MockBackend.open_stream\n"
+            "def open_stream(self, cam, controls=()):\n"
+            f"    if Path({str(busy)!r}).exists(): raise CameraOpenError('busy')\n"
+            "    return real(self, cam, controls)\n"
+            "camera.MockBackend.open_stream = open_stream; c = livereader.main(); sys.stderr.flush(); os._exit(c)")
+    spawned = []
+    real_popen = subprocess.Popen
+
+    def popen(cmd, **kw):
+        spawned.append(cmd)
+        return real_popen(cmd, **kw)
+
+    monkeypatch.setattr(live_mod.subprocess, "Popen", popen)
+    stream = LiveStream([sys.executable, "-c", code, "--root", str(root), "--cam", "scope", "--mock"],
+                        CameraLock(root / ".bench-vision", mock=True), cam="scope")
+    bv = BenchVision(root, mock=True)
+    token = stream.attach()
+    try:
+        _wait_for(lambda: stream._attempts == 2, timeout=15)  # waiting 6 s
+        stream.detach(token)
+        _wait_for(lambda: stream.status.startswith("stopped"), timeout=5)
+        busy.unlink()
+        bv.cameras.capture("scope")  # works while nobody watches
+        token = stream.attach()
+        _wait_for(lambda: stream.status == "live", timeout=5)
+        assert _args_of(spawned[-1]) == (0, 0.0, False)
+    finally:
+        stream.detach(token)
+        time.sleep(live_mod.IDLE_STOP + 0.5)
+
+
+def test_replug_while_no_page_watches_is_noticed_on_return(root, steered):
+    stream, spawned, bv, tokens = steered
+    _wait_for(lambda: stream._attempts == 2, timeout=15)  # waiting 6 s now
+    stream.detach(tokens.pop())
+    _wait_for(lambda: stream.status.startswith("stopped"), timeout=5)
+    _replug(root)
+    tokens.append(stream.attach())
+    t0 = time.monotonic()
+    _wait_for(lambda: stream.status == "live", timeout=10)
+    assert time.monotonic() - t0 < 2.5
 
 
 def test_reader_stderr_flood_does_not_stall_the_stream(tmp_path):
