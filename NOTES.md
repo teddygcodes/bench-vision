@@ -112,4 +112,3 @@ triggering another review round; none affects results, data, or error handling.
 - On a filesystem without flock, concurrent captures from different processes can lose updates to capture.<cam>.json (the camera itself isn't exclusive there either).
 - A cv2.error raised by VideoCapture() itself is reported as "stopped delivering frames" and doesn't count as a failed open for the live-view back-off.
 - The display's separate retry delay after a reader crash (not a missing camera) isn't cut short by a successful capture.
-- tests/test_stdio.py::test_ctrl_c_is_one_line_even_twice is occasionally flaky under heavy load (the SIGINT during the paused import is lost); it passes on its own.

@@ -105,26 +105,33 @@ def test_ctrl_c_is_one_line_even_twice(root):
         "        if name == 'mcp' and not Pause.done:\n"
         "            Pause.done = True\n"
         "            print('ready', flush=True)\n"
-        "            time.sleep(10)\n"
+        "            time.sleep(30)\n"
         "        return None\n"
         "sys.meta_path.insert(0, Pause())\n"
         "from bench_vision.cli import main\n"
         "sys.exit(main(sys.argv[1:]))\n"
     )
-    proc = subprocess.Popen([sys.executable, "-c", during_import, *args], env=env,
-                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    assert proc.stdout.readline().strip() == "ready"
-    proc.send_signal(signal.SIGINT)
-    out, err = proc.communicate(timeout=20)
-    assert "Traceback" not in err and proc.returncode == 130 and "interrupted" in err, (proc.returncode, err)
 
-    # 2) twice, while a (slow) capture is in flight
-    proc = subprocess.Popen([sys.executable, "-c", slow, *args], env=env,
-                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    assert proc.stdout.readline().strip() == "ready"
-    time.sleep(1.0)
-    proc.send_signal(signal.SIGINT)
-    time.sleep(0.3)
-    proc.send_signal(signal.SIGINT)
-    out, err = proc.communicate(timeout=20)
-    assert "Traceback" not in err and proc.returncode == 130 and "interrupted" in err, (proc.returncode, err)
+    def interrupt(script, pauses):
+        """Run `script`, wait for 'ready', then send SIGINT after each pause. (returncode, stderr)"""
+        proc = subprocess.Popen([sys.executable, "-c", script, *args], env=env,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            assert proc.stdout.readline().strip() == "ready"
+            for pause in pauses:
+                time.sleep(pause)
+                proc.send_signal(signal.SIGINT)
+            _, err = proc.communicate(timeout=60)
+        finally:
+            proc.kill()
+        return proc.returncode, err
+
+    # Under heavy load a SIGINT can arrive before the child is where the test means it to be, and the run
+    # then ends without being interrupted: retry those (up to 3 runs). A traceback always fails at once.
+    for script, pauses in ((during_import, [0.0]), (slow, [1.0, 0.3])):  # 1) while importing mcp, 2) twice
+        for _ in range(3):
+            rc, err = interrupt(script, pauses)
+            assert "Traceback" not in err, err
+            if rc == 130:
+                break
+        assert rc == 130 and "interrupted" in err and "\n" not in err.strip(), (rc, err)
