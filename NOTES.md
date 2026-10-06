@@ -119,4 +119,3 @@ triggering another review round; none affects results, data, or error handling.
 - The settling tests use wall-clock bounds and could flake on a heavily loaded machine.
 - Config controls skipped as read-only or inactive are only logged to the server's stderr; the capture reply and sidecar don't say so (the sidecar's `controls` just lacks them).
 - set_control reads the value back after setting it; a control that is write-only but not read-only would fail the read-back (EACCES) after the set worked. The TOMLOV's write-only controls are all read-only too, so it doesn't happen today.
-- CLAUDE.md step 5 suggests focus_absolute / focus_automatic_continuous for a soft image; the TOMLOV can't take either (it focuses with its own knob).

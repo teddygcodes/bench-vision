@@ -9,9 +9,13 @@ Coordinates for `capture_region` are full-res pixels of the rotated frame; every
 2. Zoom with `capture_cell` (add `margin=0.25` if a joint sits on a grid line) or `capture_region`.
 3. Check profiles on `side` with `capture_region` around the same joints.
 4. Before rework: `save_reference(cam, "u1-before")`; after: `compare` and zoom into the numbered boxes.
-5. If the image is soft or dark, say so and use `set_control` before judging: `focus_absolute`,
-   `exposure_time_absolute` or `gain` (turn off `focus_automatic_continuous` / set `auto_exposure=1` first;
-   older kernels: `focus_auto`, `exposure_auto`, `exposure_absolute`).
+5. If the image is soft or dark, say so before judging.
+   - **scope** focus is a physical knob, not a control: if a scope image is soft, tell Tyler to turn the
+     focus knob or press AF on the scope. Don't try `set_control` for focus on it.
+   - **side** focus is set with `set_control(cam="side", control="focus_absolute", value=...)`
+     (`focus_automatic_continuous` stays 0).
+   - Dark: `exposure_time_absolute` or `gain` (set `auto_exposure=1` first; older kernels:
+     `exposure_auto`, `exposure_absolute`).
 
 ## What to look for (and which view decides)
 | Condition | Looks like | Decide with |
